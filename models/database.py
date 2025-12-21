@@ -1,13 +1,18 @@
 """Database models for PR analysis persistence."""
 from datetime import datetime
+import uuid
 from sqlalchemy import (
     Column, Integer, String, Text, DateTime, Float, 
     Boolean, ForeignKey, JSON, Index
 )
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 
 Base = declarative_base()
+
+# Constants
+CASCADE_ALL_DELETE_ORPHAN = "all, delete-orphan"
 
 
 class PRAnalysis(Base):
@@ -72,8 +77,8 @@ class PRAnalysis(Base):
     pr_updated_at = Column(DateTime)
     
     # Relationships
-    issues = relationship("PRIssue", back_populates="analysis", cascade="all, delete-orphan")
-    metrics = relationship("PRMetrics", back_populates="analysis", uselist=False, cascade="all, delete-orphan")
+    issues = relationship("PRIssue", back_populates="analysis", cascade=CASCADE_ALL_DELETE_ORPHAN)
+    metrics = relationship("PRMetrics", back_populates="analysis", uselist=False, cascade=CASCADE_ALL_DELETE_ORPHAN)
     
     # Composite indexes and constraints for common queries
     __table_args__ = (
@@ -329,3 +334,70 @@ class UserAnalytics(Base):
     
     def __repr__(self):
         return f"<UserAnalytics(id={self.id}, author={self.author_login}, date={self.analysis_date})>"
+
+
+class User(Base):
+    """User authentication table."""
+    __tablename__ = 'users'
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String(100), unique=True, nullable=False, index=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    
+    # Profile Information
+    full_name = Column(String(255))
+    is_active = Column(Boolean, default=True)
+    is_admin = Column(Boolean, default=False)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_login = Column(DateTime)
+    
+    # Relationships
+    sessions = relationship("UserSession", back_populates="user", cascade=CASCADE_ALL_DELETE_ORPHAN)
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_user_email_active', 'email', 'is_active'),
+        Index('idx_user_username_active', 'username', 'is_active'),
+    )
+    
+    def __repr__(self):
+        return f"<User(id={self.id}, username={self.username}, email={self.email})>"
+
+
+class UserSession(Base):
+    """User session tracking table."""
+    __tablename__ = 'user_sessions'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    session_token = Column(String(500), unique=True, nullable=False, index=True)
+    
+    # Session Information
+    ip_address = Column(String(50))
+    user_agent = Column(String(500))
+    
+    # Session Status
+    is_active = Column(Boolean, default=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    last_activity = Column(DateTime, default=datetime.utcnow)
+    logged_out_at = Column(DateTime)
+    
+    # Relationships
+    user = relationship("User", back_populates="sessions")
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_session_token_active', 'session_token', 'is_active'),
+        Index('idx_session_user_active', 'user_id', 'is_active'),
+        Index('idx_session_expires', 'expires_at', 'is_active'),
+    )
+    
+    def __repr__(self):
+        return f"<UserSession(id={self.id}, user_id={self.user_id}, is_active={self.is_active})>"

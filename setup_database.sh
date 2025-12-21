@@ -280,7 +280,9 @@ try:
         'pr_metrics': 'Detailed code metrics for each PR',
         'user_statistics': 'Aggregated user performance statistics',
         'best_practices': 'Best practice recommendations',
-        'user_analytics': 'User analytics snapshots over time'
+        'user_analytics': 'User analytics snapshots over time',
+        'users': 'User authentication and profile information',
+        'user_sessions': 'Active user login sessions with JWT tokens'
     }
     
     for table_name, description in tables_info.items():

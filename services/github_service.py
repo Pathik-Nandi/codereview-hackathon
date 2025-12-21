@@ -1,0 +1,430 @@
+"""GitHub service for interacting with GitHub API."""
+import hmac
+import hashlib
+from typing import Optional
+from github import Github, GithubException
+from models.pr_event import PREvent, PRFile
+from utils.logger import logger
+from utils.config import config
+
+
+class GitHubService:
+    """Service for GitHub API interactions."""
+    
+    def __init__(self):
+        """Initialize GitHub service."""
+        self.logger = logger.bind(service="github")
+        self.github = Github(config.github_token)
+        self.webhook_secret = config.github_webhook_secret
+    
+    def verify_webhook_signature(self, payload: bytes, signature: str) -> bool:
+        """
+        Verify GitHub webhook signature.
+        
+        Args:
+            payload: The webhook payload
+            signature: The signature from GitHub
+            
+        Returns:
+            True if signature is valid
+        """
+        if not self.webhook_secret:
+            self.logger.warning("Webhook secret not configured")
+            return True
+        
+        expected_signature = 'sha256=' + hmac.new(
+            self.webhook_secret.encode(),
+            payload,
+            hashlib.sha256
+        ).hexdigest()
+        
+        return hmac.compare_digest(expected_signature, signature)
+    
+    def get_pr_details(self, repository: str, pr_number: int) -> Optional[dict]:
+        """
+        Get PR details from GitHub.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            
+        Returns:
+            Dictionary with PR details or None if not found
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            
+            details = {
+                'title': pr.title,
+                'body': pr.body or '',
+                'state': pr.state,
+                'user': {
+                    'login': pr.user.login
+                },
+                'head': {
+                    'ref': pr.head.ref
+                },
+                'base': {
+                    'ref': pr.base.ref
+                },
+                'created_at': pr.created_at.isoformat() if pr.created_at else None,
+                'updated_at': pr.updated_at.isoformat() if pr.updated_at else None
+            }
+            
+            self.logger.info(
+                "Retrieved PR details",
+                repository=repository,
+                pr_number=pr_number,
+                title=pr.title
+            )
+            
+            return details
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to get PR details",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            return None
+    
+    def get_pr_files(self, repository: str, pr_number: int) -> list:
+        """
+        Get files changed in a PR.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            
+        Returns:
+            List of PRFile objects
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            
+            files = []
+            for file in pr.get_files():
+                files.append(PRFile(
+                    filename=file.filename,
+                    status=file.status,
+                    additions=file.additions,
+                    deletions=file.deletions,
+                    changes=file.changes,
+                    patch=file.patch
+                ))
+            
+            self.logger.info(
+                "Retrieved PR files",
+                repository=repository,
+                pr_number=pr_number,
+                file_count=len(files)
+            )
+            
+            return files
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to get PR files",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            raise
+    
+    def post_comment(self, repository: str, pr_number: int, comment: str) -> bool:
+        """
+        Post a comment on a PR.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            comment: Comment text
+            
+        Returns:
+            True if successful
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            pr.create_issue_comment(comment)
+            
+            self.logger.info(
+                "Posted PR comment",
+                repository=repository,
+                pr_number=pr_number
+            )
+            
+            return True
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to post comment",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            return False
+    
+    def create_review(
+        self, 
+        repository: str, 
+        pr_number: int, 
+        event: str,
+        body: Optional[str] = None
+    ) -> bool:
+        """
+        Create a PR review.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            event: Review event (APPROVE, REQUEST_CHANGES, COMMENT)
+            body: Review body text
+            
+        Returns:
+            True if successful
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            pr.create_review(body=body, event=event)
+            
+            self.logger.info(
+                "Created PR review",
+                repository=repository,
+                pr_number=pr_number,
+                event=event
+            )
+            
+            return True
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to create review",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            return False
+    
+    def request_changes(self, repository: str, pr_number: int, body: str) -> bool:
+        """Request changes on a PR."""
+        return self.create_review(repository, pr_number, "REQUEST_CHANGES", body)
+    
+    def approve_pr(self, repository: str, pr_number: int, body: str) -> bool:
+        """Approve a PR."""
+        return self.create_review(repository, pr_number, "APPROVE", body)
+    
+    def merge_pr(
+        self, 
+        repository: str, 
+        pr_number: int, 
+        merge_method: str = "squash",
+        commit_title: Optional[str] = None,
+        commit_message: Optional[str] = None,
+        delete_branch: bool = True
+    ) -> dict:
+        """
+        Merge a pull request.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            merge_method: Merge method (merge, squash, rebase)
+            commit_title: Custom commit title
+            commit_message: Custom commit message
+            delete_branch: Whether to delete the branch after merge
+            
+        Returns:
+            Dictionary with merge result containing:
+            - success: bool
+            - sha: str (commit SHA if successful)
+            - message: str (status message)
+            - merged: bool
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            
+            # Check if PR is already merged
+            if pr.merged:
+                self.logger.info(
+                    "PR already merged",
+                    repository=repository,
+                    pr_number=pr_number
+                )
+                return {
+                    'success': False,
+                    'merged': True,
+                    'message': 'PR is already merged',
+                    'sha': pr.merge_commit_sha
+                }
+            
+            # Check if PR is mergeable
+            if pr.mergeable is False:
+                self.logger.warning(
+                    "PR is not mergeable",
+                    repository=repository,
+                    pr_number=pr_number,
+                    mergeable_state=pr.mergeable_state
+                )
+                return {
+                    'success': False,
+                    'merged': False,
+                    'message': f'PR is not mergeable (state: {pr.mergeable_state})',
+                    'mergeable_state': pr.mergeable_state
+                }
+            
+            # Perform the merge
+            result = pr.merge(
+                commit_title=commit_title,
+                commit_message=commit_message,
+                merge_method=merge_method
+            )
+            
+            self.logger.info(
+                "PR merged successfully",
+                repository=repository,
+                pr_number=pr_number,
+                merge_method=merge_method,
+                sha=result.sha
+            )
+            
+            # Delete branch if requested
+            if delete_branch and result.merged:
+                try:
+                    ref = repo.get_git_ref(f"heads/{pr.head.ref}")
+                    ref.delete()
+                    self.logger.info(
+                        "Branch deleted after merge",
+                        repository=repository,
+                        branch=pr.head.ref
+                    )
+                except GithubException as e:
+                    self.logger.warning(
+                        "Failed to delete branch after merge",
+                        repository=repository,
+                        branch=pr.head.ref,
+                        error=str(e)
+                    )
+            
+            return {
+                'success': True,
+                'merged': result.merged,
+                'sha': result.sha,
+                'message': result.message
+            }
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to merge PR",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            return {
+                'success': False,
+                'merged': False,
+                'message': f'Merge failed: {str(e)}'
+            }
+    
+    def get_pr_reviews(self, repository: str, pr_number: int) -> list:
+        """
+        Get all reviews for a PR.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            
+        Returns:
+            List of review objects with state and user info
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            reviews = pr.get_reviews()
+            
+            review_list = []
+            for review in reviews:
+                review_list.append({
+                    'user': review.user.login,
+                    'state': review.state,  # APPROVED, CHANGES_REQUESTED, COMMENTED
+                    'submitted_at': review.submitted_at.isoformat() if review.submitted_at else None
+                })
+            
+            self.logger.info(
+                "Retrieved PR reviews",
+                repository=repository,
+                pr_number=pr_number,
+                review_count=len(review_list)
+            )
+            
+            return review_list
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to get PR reviews",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            return []
+    
+    def check_pr_status_checks(self, repository: str, pr_number: int) -> dict:
+        """
+        Check the status of all CI/CD checks on a PR.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            
+        Returns:
+            Dictionary with status check results
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            commit = repo.get_commit(pr.head.sha)
+            
+            # Get combined status
+            status = commit.get_combined_status()
+            
+            result = {
+                'state': status.state,  # success, pending, failure
+                'total_count': status.total_count,
+                'statuses': []
+            }
+            
+            for s in status.statuses:
+                result['statuses'].append({
+                    'context': s.context,
+                    'state': s.state,
+                    'description': s.description
+                })
+            
+            self.logger.info(
+                "Retrieved PR status checks",
+                repository=repository,
+                pr_number=pr_number,
+                state=status.state,
+                check_count=status.total_count
+            )
+            
+            return result
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to get PR status checks",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            return {
+                'state': 'unknown',
+                'total_count': 0,
+                'statuses': []
+            }
+

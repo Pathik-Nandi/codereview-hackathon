@@ -1,0 +1,1731 @@
+"""Main application entry point."""
+import time
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
+from models.pr_event import PREvent
+from models.feedback import FeedbackFormatter
+from agents.dispatcher import AgentDispatcher
+from agents.auto_merge_agent import AutoMergeAgent
+from services.github_service import GitHubService
+from services.slack_service import SlackService
+from services.dashboard_service import DashboardService
+from services.database_service import DatabaseService
+from services.analytics_service import AnalyticsService
+from utils.logger import logger
+from utils.config import config
+
+
+# Constants
+ERROR_DB_SERVICE_UNAVAILABLE = 'Database service not available'
+ERROR_ANALYTICS_AGENT_UNAVAILABLE = 'Analytics Processing Agent not available'
+ERROR_REQUEST_BODY_REQUIRED = 'Request body is required'
+ERROR_MISSING_REPO_PR = 'Missing required fields: repository and pr_number'
+
+app = Flask(__name__)
+
+# Initialize components
+dispatcher = AgentDispatcher()
+github_service = GitHubService()
+slack_service = SlackService()
+dashboard_service = DashboardService()
+auto_merge_agent = AutoMergeAgent()
+
+# Initialize database services if enabled
+db_service = None
+analytics_service = None
+db_persistence_agent = None
+analytics_processing_agent = None
+
+if config.get('database.enabled', False):
+    try:
+        db_service = DatabaseService()
+        analytics_service = AnalyticsService(db_service)
+        
+        # Initialize specialized agents
+        from agents.database_persistence_agent import DatabasePersistenceAgent
+        from agents.analytics_processing_agent import AnalyticsProcessingAgent
+        
+        db_persistence_agent = DatabasePersistenceAgent(db_service)
+        analytics_processing_agent = AnalyticsProcessingAgent(db_service, analytics_service)
+        
+        logger.info("Database services and agents initialized successfully")
+    except Exception as e:
+        logger.error("Failed to initialize database services", error=str(e))
+        logger.warning("Running without database persistence")
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint."""
+    return jsonify({
+        'status': 'healthy',
+        'service': 'multi-agent-pr-review',
+        'version': '1.0.0'
+    })
+
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze_pr():
+    """
+    Main API endpoint to submit a PR for analysis.
+    
+    Request Body (Simple):
+    {
+        "repository": "owner/repo",
+        "pr_number": 123,
+        "agent_type": "security"  // optional: static_analysis, security, code_quality, context
+    }
+    
+    The system will automatically fetch PR details from GitHub.
+    """
+    try:
+        data = request.json
+        
+        if not data:
+            return jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+        
+        # Extract PR information
+        repository = data.get('repository')
+        pr_number = data.get('pr_number')
+        agent_type = data.get('agent_type')  # Optional
+        
+        if not repository or not pr_number:
+            return jsonify({'error': ERROR_MISSING_REPO_PR}), 400
+        
+        logger.info(
+            "Received PR analysis request",
+            repository=repository,
+            pr_number=pr_number,
+            requested_agent=agent_type
+        )
+        
+        # Fetch PR details from GitHub automatically
+        logger.info("Fetching PR details from GitHub...")
+        pr_details = github_service.get_pr_details(repository, pr_number)
+        
+        if not pr_details:
+            return jsonify({
+                'error': f'Could not fetch PR #{pr_number} from {repository}. Check repository name and PR number.'
+            }), 404
+        
+        # Create PR event object with fetched details
+        from datetime import datetime
+        from models.pr_event import PRAuthor
+        
+        pr_event = PREvent(
+            action='manual',
+            pr_number=pr_number,
+            pr_title=pr_details.get('title', ''),
+            pr_description=pr_details.get('body', ''),
+            pr_url=f"https://github.com/{repository}/pull/{pr_number}",
+            repository=repository,
+            repository_url=f"https://github.com/{repository}",
+            author=PRAuthor(
+                login=pr_details.get('user', {}).get('login', ''),
+                id=0,
+                avatar_url=''
+            ),
+            base_branch=pr_details.get('base', {}).get('ref', 'main'),
+            head_branch=pr_details.get('head', {}).get('ref', ''),
+            files=[],
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            is_draft=False
+        )
+        
+        # Get PR files from GitHub
+        pr_event.files = github_service.get_pr_files(repository, pr_number)
+        
+        # Dispatch to agent
+        result = dispatcher.dispatch(pr_event, agent_type)
+        
+        # Skip feedback for now - just return response
+        # send_feedback(pr_event, result)
+        
+        # Count issues by severity
+        critical_count = sum(1 for issue in result.issues if issue.severity == 'critical')
+        high_count = sum(1 for issue in result.issues if issue.severity == 'high')
+        medium_count = sum(1 for issue in result.issues if issue.severity == 'medium')
+        low_count = sum(1 for issue in result.issues if issue.severity == 'low')
+        
+        # Prepare response
+        response_data = {
+            'status': 'success',
+            'message': 'Analysis completed',
+            'pr_number': pr_number,
+            'repository': repository,
+            'agent_used': result.agent_name,
+            'success': result.success,
+            'execution_time': result.execution_time,
+            'issues_found': len(result.issues),
+            'critical_issues': critical_count,
+            'high_issues': high_count,
+            'medium_issues': medium_count,
+            'low_issues': low_count,
+            'issues': [
+                {
+                    'file': issue.file,
+                    'line': issue.line,
+                    'column': issue.column,
+                    'type': issue.type.value if hasattr(issue.type, 'value') else str(issue.type),
+                    'severity': issue.severity.value if hasattr(issue.severity, 'value') else str(issue.severity),
+                    'code': issue.code,
+                    'message': issue.message,
+                    'suggestion': issue.suggestion,
+                    'metadata': issue.metadata
+                }
+                for issue in result.issues
+            ],
+            'metrics': result.metrics,
+            'agent_breakdown': result.metadata.get('agent_breakdown', {}) if result.metadata else {},
+            'error': result.error
+        }
+        
+        # Save to database using persistence agent if enabled
+        persistence_result = None
+        if db_persistence_agent:
+            try:
+                # Prepare PR data for database
+                pr_data = {
+                    'repository': repository,
+                    'pr_number': pr_number,
+                    'title': pr_details.get('title', ''),
+                    'description': pr_details.get('body', ''),
+                    'url': f"https://github.com/{repository}/pull/{pr_number}",
+                    'author': {
+                        'login': pr_details.get('user', {}).get('login', ''),
+                        'email': pr_details.get('user', {}).get('email'),
+                        'name': pr_details.get('user', {}).get('name'),
+                        'id': pr_details.get('user', {}).get('id', 0)
+                    },
+                    'base_branch': pr_details.get('base', {}).get('ref', 'main'),
+                    'head_branch': pr_details.get('head', {}).get('ref', ''),
+                    'files_changed': len(pr_event.files),
+                    'lines_added': sum(f.additions for f in pr_event.files),
+                    'lines_deleted': sum(f.deletions for f in pr_event.files),
+                    'is_draft': pr_details.get('draft', False),
+                    'created_at': pr_details.get('created_at'),
+                    'updated_at': pr_details.get('updated_at')
+                }
+                
+                # Get author email from additional field if provided
+                author_email = data.get('author_email')
+                
+                # Use persistence agent to save
+                persistence_result = db_persistence_agent.persist_analysis(
+                    pr_data=pr_data,
+                    analysis_result=result,
+                    author_email=author_email
+                )
+                
+                if persistence_result.get('success'):
+                    logger.info(
+                        "PR analysis persisted by Database Persistence Agent",
+                        pr_analysis_id=persistence_result.get('pr_analysis_id'),
+                        repository=repository,
+                        pr_number=pr_number
+                    )
+                    response_data['database_id'] = persistence_result.get('pr_analysis_id')
+                
+            except Exception as db_error:
+                logger.error(
+                    "Database Persistence Agent failed",
+                    error=str(db_error),
+                    repository=repository,
+                    pr_number=pr_number
+                )
+                # Continue without failing the request
+        
+        return jsonify(response_data), 200
+        
+    except ValueError as e:
+        logger.error("Validation error", error=str(e))
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        logger.error("Analysis error", error=str(e), exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/webhook/github', methods=['POST'])
+def github_webhook():
+    """
+    GitHub webhook endpoint for PR events (optional).
+    
+    Receives PR events and triggers single-agent analysis.
+    """
+    try:
+        # Verify webhook signature
+        signature = request.headers.get('X-Hub-Signature-256', '')
+        if not github_service.verify_webhook_signature(request.data, signature):
+            logger.warning("Invalid webhook signature")
+            return jsonify({'error': 'Invalid signature'}), 401
+        
+        payload = request.json
+        
+        # Check if it's a PR event we care about
+        if 'pull_request' not in payload:
+            return jsonify({'message': 'Not a PR event'}), 200
+        
+        action = payload.get('action')
+        if action not in ['opened', 'synchronize', 'reopened']:
+            return jsonify({'message': f'Ignoring action: {action}'}), 200
+        
+        # Parse PR event
+        pr_event = PREvent.from_webhook(payload)
+        
+        logger.info(
+            "Received PR webhook",
+            action=action,
+            pr_number=pr_event.pr_number,
+            repository=pr_event.repository
+        )
+        
+        # Skip draft PRs if configured
+        if pr_event.is_draft:
+            logger.info("Skipping draft PR", pr_number=pr_event.pr_number)
+            return jsonify({'message': 'Draft PR skipped'}), 200
+        
+        # Get PR files
+        pr_event.files = github_service.get_pr_files(
+            pr_event.repository,
+            pr_event.pr_number
+        )
+        
+        # Dispatch to single agent (strategy determines which one)
+        result = dispatcher.dispatch(pr_event)
+        
+        # Send feedback
+        send_feedback(pr_event, result)
+        
+        return jsonify({
+            'message': 'Analysis completed',
+            'pr_number': pr_event.pr_number,
+            'agent_used': result.agent_name
+        }), 200
+        
+    except Exception as e:
+        logger.error("Webhook processing error", error=str(e), exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+def create_pr_event_from_request(data: dict) -> PREvent:
+    """
+    Create a PREvent object from API request data.
+    
+    Args:
+        data: Request data dictionary
+        
+    Returns:
+        PREvent object
+    """
+    from datetime import datetime
+    from models.pr_event import PRAuthor
+    
+    return PREvent(
+        action=data.get('action', 'opened'),
+        pr_number=data['pr_number'],
+        pr_title=data.get('pr_title', f"PR #{data['pr_number']}"),
+        pr_description=data.get('pr_description'),
+        pr_url=data.get('pr_url', f"https://github.com/{data['repository']}/pull/{data['pr_number']}"),
+        repository=data['repository'],
+        repository_url=data.get('repository_url', f"https://github.com/{data['repository']}"),
+        author=PRAuthor(
+            login=data.get('author', 'unknown'),
+            id=data.get('author_id', 0),
+            avatar_url=data.get('author_avatar', '')
+        ),
+        base_branch=data.get('base_branch', 'main'),
+        head_branch=data.get('head_branch', 'feature'),
+        files=[],  # Will be populated from GitHub API
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        is_draft=data.get('is_draft', False)
+    )
+
+
+def send_feedback(pr_event: PREvent, result):
+    """
+    Send feedback to configured outputs.
+    
+    Args:
+        pr_event: The PR event
+        result: Agent analysis result (single agent)
+    """
+    # Format feedback for single agent result
+    feedback_text = format_single_agent_feedback(result)
+    
+    # GitHub PR Comments
+    if config.get('output.github.enabled'):
+        github_service.post_comment(
+            pr_event.repository,
+            pr_event.pr_number,
+            feedback_text
+        )
+        
+        # Create review if configured
+        if config.get('output.github.create_review'):
+            if result.critical_count > 0:
+                github_service.request_changes(
+                    pr_event.repository,
+                    pr_event.pr_number,
+                    "Critical issues found. Please review."
+                )
+    
+    # Slack Notifications
+    if config.get('output.slack.enabled'):
+        slack_message = format_slack_message(pr_event, result)
+        slack_service.send_pr_notification(slack_message)
+        
+        # Send critical alert if needed
+        if result.critical_count > 0 and config.get('output.slack.mention_on_critical'):
+            slack_service.send_critical_alert(
+                pr_event.repository,
+                pr_event.pr_number,
+                pr_event.pr_url,
+                result.critical_count
+            )
+    
+    # Dashboard
+    if config.get('output.dashboard.enabled'):
+        dashboard_payload = {
+            'pr_number': pr_event.pr_number,
+            'repository': pr_event.repository,
+            'pr_url': pr_event.pr_url,
+            'pr_title': pr_event.pr_title,
+            'agent_used': result.agent_name,
+            'execution_time': result.execution_time,
+            'issues_found': result.total_issues,
+            'critical_count': result.critical_count,
+            'high_count': result.high_count,
+            'metrics': result.metrics
+        }
+        dashboard_service.submit_analysis(dashboard_payload)
+
+
+def format_single_agent_feedback(result) -> str:
+    """Format feedback for a single agent result."""
+    lines = []
+    lines.append(f"## 🤖 PR Analysis by {result.agent_name}\n")
+    
+    # Summary
+    lines.append("### 📊 Summary")
+    lines.append(f"- **Total Issues**: {result.total_issues}")
+    lines.append(f"- 🔴 Critical: {result.critical_count}")
+    lines.append(f"- 🟠 High: {result.high_count}")
+    lines.append(f"- ⏱️ Analysis Time: {result.execution_time:.2f}s\n")
+    
+    if result.critical_count > 0:
+        lines.append("⚠️ **Critical issues found - please address before merging.**\n")
+    
+    # Issues
+    if result.issues:
+        lines.append(f"### Issues Found ({len(result.issues)})\n")
+        
+        for i, issue in enumerate(result.issues[:10], 1):
+            severity_emoji = {
+                'critical': '🔴',
+                'high': '🟠',
+                'medium': '🟡',
+                'low': '🟢',
+                'info': 'ℹ️'
+            }.get(issue.severity.value, '•')
+            
+            location = f"{issue.file}:{issue.line}" if issue.line else issue.file
+            lines.append(f"{i}. {severity_emoji} **{location}**")
+            lines.append(f"   {issue.message}")
+            if issue.suggestion:
+                lines.append(f"   💡 *Suggestion: {issue.suggestion}*")
+            lines.append("")
+        
+        if len(result.issues) > 10:
+            lines.append(f"*...and {len(result.issues) - 10} more issues*\n")
+    
+    # Metrics
+    if result.metrics:
+        lines.append("### 📈 Metrics")
+        for key, value in result.metrics.items():
+            lines.append(f"- **{key}**: {value}")
+    
+    return "\n".join(lines)
+
+
+def format_slack_message(pr_event: PREvent, result) -> dict:
+    """Format Slack message for single agent result."""
+    blocks = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": "🤖 PR Analysis Complete"
+            }
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Repository:*\n{pr_event.repository}"},
+                {"type": "mrkdwn", "text": f"*PR:*\n#{pr_event.pr_number}"}
+            ]
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Agent:*\n{result.agent_name}"},
+                {"type": "mrkdwn", "text": f"*Issues:*\n{result.total_issues}"}
+            ]
+        }
+    ]
+    
+    if result.critical_count > 0:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"⚠️ *{result.critical_count} critical issue(s) found*"
+            }
+        })
+    
+    return {
+        'blocks': blocks,
+        'pr_url': pr_event.pr_url
+    }
+
+
+# ============================================================================
+# DASHBOARD API ENDPOINTS
+# ============================================================================
+
+@app.route('/api/dashboard/user/<author_login>/insights', methods=['GET'])
+def get_user_insights(author_login: str):
+    """
+    Get comprehensive insights for a user.
+    
+    Returns best practices, bad practices, quality scores, improvement areas,
+    and personalized recommendations.
+    """
+    if not analytics_service:
+        return jsonify({'error': 'Analytics service not available'}), 503
+    
+    try:
+        insights = analytics_service.get_user_insights(author_login)
+        return jsonify(insights), 200
+    except Exception as e:
+        logger.error("Failed to get user insights", error=str(e), author=author_login)
+        return jsonify({'error': 'Failed to generate insights'}), 500
+
+
+@app.route('/api/dashboard/user/<author_login>/statistics', methods=['GET'])
+def get_user_statistics(author_login: str):
+    """Get user statistics summary."""
+    if not db_service:
+        return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        user_stats = db_service.get_user_statistics(author_login)
+        
+        if not user_stats:
+            return jsonify({'error': 'User not found'}), 404
+        
+        return jsonify({
+            'author_login': user_stats.author_login,
+            'author_email': user_stats.author_email,
+            'total_prs': user_stats.total_prs,
+            'total_issues': user_stats.total_issues_found,
+            'avg_quality_score': user_stats.avg_quality_score,
+            'avg_security_score': user_stats.avg_security_score,
+            'avg_maintainability_score': user_stats.avg_maintainability_score,
+            'avg_coverage': user_stats.avg_coverage,
+            'severity_distribution': {
+                'critical': user_stats.critical_issues_total,
+                'high': user_stats.high_issues_total,
+                'medium': user_stats.medium_issues_total,
+                'low': user_stats.low_issues_total
+            },
+            'trends': {
+                'quality': user_stats.quality_trend,
+                'security': user_stats.security_trend,
+                'coverage': user_stats.coverage_trend
+            },
+            'common_issues': user_stats.common_issues,
+            'improvement_areas': user_stats.improvement_areas,
+            'strengths': user_stats.strengths,
+            'first_pr_date': user_stats.first_pr_date.isoformat() if user_stats.first_pr_date else None,
+            'last_pr_date': user_stats.last_pr_date.isoformat() if user_stats.last_pr_date else None
+        }), 200
+    except Exception as e:
+        logger.error("Failed to get user statistics", error=str(e), author=author_login)
+        return jsonify({'error': 'Failed to retrieve statistics'}), 500
+
+
+@app.route('/api/dashboard/user/<author_login>/prs', methods=['GET'])
+def get_user_prs(author_login: str):
+    """Get recent PRs for a user."""
+    if not db_service:
+        return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        limit = request.args.get('limit', 20, type=int)
+        prs = db_service.get_user_prs(author_login, limit=limit)
+        
+        return jsonify({
+            'author_login': author_login,
+            'total': len(prs),
+            'prs': [
+                {
+                    'id': pr.id,
+                    'repository': pr.repository,
+                    'pr_number': pr.pr_number,
+                    'pr_title': pr.pr_title,
+                    'pr_url': pr.pr_url,
+                    'total_issues': pr.total_issues,
+                    'quality_score': pr.overall_quality_score,
+                    'security_score': pr.security_score,
+                    'analyzed_at': pr.analyzed_at.isoformat(),
+                    'severity_counts': {
+                        'critical': pr.critical_issues,
+                        'high': pr.high_issues,
+                        'medium': pr.medium_issues,
+                        'low': pr.low_issues
+                    }
+                }
+                for pr in prs
+            ]
+        }), 200
+    except Exception as e:
+        logger.error("Failed to get user PRs", error=str(e), author=author_login)
+        return jsonify({'error': 'Failed to retrieve PRs'}), 500
+
+
+@app.route('/api/dashboard/repository/<path:repository>/stats', methods=['GET'])
+def get_repository_stats(repository: str):
+    """Get aggregated statistics for a repository."""
+    if not db_service:
+        return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        stats = db_service.get_repository_stats(repository)
+        
+        if not stats:
+            return jsonify({'error': 'No data found for repository'}), 404
+        
+        return jsonify(stats), 200
+    except Exception as e:
+        logger.error("Failed to get repository stats", error=str(e), repository=repository)
+        return jsonify({'error': 'Failed to retrieve statistics'}), 500
+
+
+@app.route('/api/dashboard/repository/<path:repository>/insights', methods=['GET'])
+def get_repository_insights(repository: str):
+    """Get comprehensive insights for a repository."""
+    if not analytics_service:
+        return jsonify({'error': 'Analytics service not available'}), 503
+    
+    try:
+        insights = analytics_service.get_repository_insights(repository)
+        return jsonify(insights), 200
+    except Exception as e:
+        logger.error("Failed to get repository insights", error=str(e), repository=repository)
+        return jsonify({'error': 'Failed to generate insights'}), 500
+
+
+@app.route('/api/dashboard/pr/<path:repository>/<int:pr_number>', methods=['GET'])
+def get_pr_analysis(repository: str, pr_number: int):
+    """Get detailed analysis for a specific PR."""
+    if not db_service:
+        return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        pr_analysis = db_service.get_pr_analysis(repository, pr_number)
+        
+        if not pr_analysis:
+            return jsonify({'error': 'PR analysis not found'}), 404
+        
+        return jsonify({
+            'id': pr_analysis.id,
+            'repository': pr_analysis.repository,
+            'pr_number': pr_analysis.pr_number,
+            'pr_title': pr_analysis.pr_title,
+            'pr_url': pr_analysis.pr_url,
+            'author_login': pr_analysis.author_login,
+            'author_email': pr_analysis.author_email,
+            'total_issues': pr_analysis.total_issues,
+            'severity_distribution': {
+                'critical': pr_analysis.critical_issues,
+                'high': pr_analysis.high_issues,
+                'medium': pr_analysis.medium_issues,
+                'low': pr_analysis.low_issues
+            },
+            'agent_breakdown': {
+                'static_analysis': pr_analysis.static_analysis_issues,
+                'security': pr_analysis.security_issues,
+                'code_quality': pr_analysis.code_quality_issues,
+                'context': pr_analysis.context_issues,
+                'coverage': pr_analysis.coverage_issues
+            },
+            'scores': {
+                'overall_quality': pr_analysis.overall_quality_score,
+                'security': pr_analysis.security_score,
+                'maintainability': pr_analysis.maintainability_score
+            },
+            'coverage_metrics': {
+                'estimated_coverage': pr_analysis.estimated_coverage,
+                'test_to_code_ratio': pr_analysis.test_to_code_ratio,
+                'complexity_score': pr_analysis.complexity_score
+            },
+            'analyzed_at': pr_analysis.analyzed_at.isoformat(),
+            'analysis_duration_ms': pr_analysis.analysis_duration_ms
+        }), 200
+    except Exception as e:
+        logger.error("Failed to get PR analysis", error=str(e), repository=repository, pr_number=pr_number)
+        return jsonify({'error': 'Failed to retrieve analysis'}), 500
+
+
+@app.route('/api/dashboard/init-db', methods=['POST'])
+def initialize_database():
+    """Initialize database tables (admin endpoint)."""
+    if not db_service:
+        return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        db_service.create_tables()
+        return jsonify({
+            'status': 'success',
+            'message': 'Database tables created successfully'
+        }), 200
+    except Exception as e:
+        logger.error("Failed to initialize database", error=str(e))
+        return jsonify({'error': 'Failed to create database tables'}), 500
+
+
+# ============================================================================
+# ANALYTICS PROCESSING AGENT ENDPOINTS
+# ============================================================================
+
+@app.route('/api/analytics/user/<author_login>/analyze', methods=['GET'])
+def analyze_user_over_time(author_login: str):
+    """
+    Analyze user's performance over a time range using Analytics Processing Agent.
+    
+    Query Parameters:
+        - start_date: ISO format date (YYYY-MM-DD) - optional
+        - end_date: ISO format date (YYYY-MM-DD) - optional
+        - days: Number of days to look back (alternative to start_date) - optional
+        - min_prs: Minimum PRs required (default: 5)
+    
+    Returns comprehensive analysis with:
+    - Quality metrics and code scores
+    - Best practices identified
+    - Bad practices to avoid
+    - Improvement recommendations
+    - Trend analysis
+    """
+    if not analytics_processing_agent:
+        return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
+    
+    try:
+        # Parse query parameters
+        start_date = None
+        end_date = None
+        
+        start_date_str = request.args.get('start_date')
+        end_date_str = request.args.get('end_date')
+        days = request.args.get('days', type=int)
+        min_prs = request.args.get('min_prs', 5, type=int)
+        
+        # Parse dates
+        if start_date_str:
+            start_date = datetime.fromisoformat(start_date_str)
+        elif days:
+            start_date = datetime.now() - timedelta(days=days)
+        
+        if end_date_str:
+            end_date = datetime.fromisoformat(end_date_str)
+        else:
+            end_date = datetime.now()
+        
+        # Run analysis
+        analysis = analytics_processing_agent.analyze_user_over_time(
+            author_login=author_login,
+            start_date=start_date,
+            end_date=end_date,
+            min_prs=min_prs
+        )
+        
+        return jsonify(analysis), 200
+        
+    except ValueError as e:
+        return jsonify({'error': f'Invalid date format: {str(e)}'}), 400
+    except Exception as e:
+        logger.error("Failed to analyze user over time", error=str(e), author=author_login)
+        return jsonify({'error': 'Failed to generate analysis'}), 500
+
+
+@app.route('/api/analytics/user/<author_login>/summary', methods=['GET'])
+def get_user_analytics_summary(author_login: str):
+    """
+    Get quick analytics summary for user (last 30 days by default).
+    
+    Query Parameters:
+        - days: Number of days to analyze (default: 30)
+    """
+    if not analytics_processing_agent:
+        return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
+    
+    try:
+        days = request.args.get('days', 30, type=int)
+        start_date = datetime.now() - timedelta(days=days)
+        
+        analysis = analytics_processing_agent.analyze_user_over_time(
+            author_login=author_login,
+            start_date=start_date,
+            end_date=datetime.now(),
+            min_prs=1  # Lower threshold for summary
+        )
+        
+        if not analysis.get('success'):
+            return jsonify(analysis), 200
+        
+        # Return condensed summary
+        summary = {
+            'author_login': author_login,
+            'period_days': days,
+            'total_prs': analysis['analysis_period']['total_prs'],
+            'code_scores': analysis['code_scores'],
+            'quality_metrics': {
+                'avg_issues_per_pr': analysis['quality_metrics']['avg_issues_per_pr'],
+                'severity_distribution': analysis['quality_metrics']['severity_distribution']
+            },
+            'top_best_practices': analysis['best_practices'][:3],
+            'top_bad_practices': analysis['bad_practices'][:3],
+            'trends': analysis.get('trend_analysis', {})
+        }
+        
+        return jsonify(summary), 200
+        
+    except Exception as e:
+        logger.error("Failed to get analytics summary", error=str(e), author=author_login)
+        return jsonify({'error': 'Failed to generate summary'}), 500
+
+
+@app.route('/api/analytics/user/<author_login>/recommendations', methods=['GET'])
+def get_user_recommendations(author_login: str):
+    """
+    Get personalized improvement recommendations for user.
+    
+    Query Parameters:
+        - days: Number of days to analyze (default: 90)
+        - priority: Filter by priority (critical, high, medium, low)
+    """
+    if not analytics_processing_agent:
+        return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
+    
+    try:
+        days = request.args.get('days', 90, type=int)
+        priority_filter = request.args.get('priority')
+        
+        start_date = datetime.now() - timedelta(days=days)
+        
+        analysis = analytics_processing_agent.analyze_user_over_time(
+            author_login=author_login,
+            start_date=start_date,
+            end_date=datetime.now(),
+            min_prs=5
+        )
+        
+        if not analysis.get('success'):
+            return jsonify(analysis), 200
+        
+        recommendations = analysis.get('improvement_recommendations', [])
+        
+        # Filter by priority if specified
+        if priority_filter:
+            recommendations = [r for r in recommendations if r.get('priority') == priority_filter]
+        
+        return jsonify({
+            'author_login': author_login,
+            'analysis_period_days': days,
+            'total_recommendations': len(recommendations),
+            'recommendations': recommendations
+        }), 200
+        
+    except Exception as e:
+        logger.error("Failed to get recommendations", error=str(e), author=author_login)
+        return jsonify({'error': 'Failed to generate recommendations'}), 500
+
+
+@app.route('/api/analytics/user/<author_login>/trends', methods=['GET'])
+def get_user_trends(author_login: str):
+    """
+    Get quality trends for user over time.
+    
+    Query Parameters:
+        - days: Number of days to analyze (default: 180)
+    """
+    if not analytics_processing_agent:
+        return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
+    
+    try:
+        days = request.args.get('days', 180, type=int)
+        start_date = datetime.now() - timedelta(days=days)
+        
+        analysis = analytics_processing_agent.analyze_user_over_time(
+            author_login=author_login,
+            start_date=start_date,
+            end_date=datetime.now(),
+            min_prs=10  # Need more data for trends
+        )
+        
+        if not analysis.get('success'):
+            return jsonify(analysis), 200
+        
+        return jsonify({
+            'author_login': author_login,
+            'analysis_period_days': days,
+            'trend_analysis': analysis.get('trend_analysis', {}),
+            'code_scores': analysis.get('code_scores', {})
+        }), 200
+        
+    except Exception as e:
+        logger.error("Failed to get trends", error=str(e), author=author_login)
+        return jsonify({'error': 'Failed to generate trends'}), 500
+
+
+@app.route('/api/prs/list', methods=['POST'])
+def get_prs_by_email():
+    """
+    Get list of PRs for a user by email and date range.
+    
+    Request Body:
+    {
+        "email": "user@example.com",
+        "start_date": "2024-01-01",  // optional, format: YYYY-MM-DD
+        "end_date": "2024-12-31",    // optional, format: YYYY-MM-DD
+        "limit": 100                 // optional, default: 100
+    }
+    
+    Response:
+    {
+        "success": true,
+        "email": "user@example.com",
+        "total_prs": 28,
+        "prs": [
+            {
+                "pr_number": 123,
+                "pr_title": "Add new feature",
+                "pr_url": "https://github.com/...",
+                "repository": "owner/repo",
+                "author_login": "username",
+                "analyzed_at": "2024-12-20T10:30:00Z",
+                "overall_quality_score": 85.5,
+                "security_score": 100.0,
+                "total_issues": 10,
+                "critical_issues": 0,
+                "files_changed": 5,
+                "lines_added": 150,
+                "lines_deleted": 20
+            },
+            ...
+        ]
+    }
+    """
+    if not db_service:
+        return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        data = request.json
+        
+        if not data or 'email' not in data:
+            return jsonify({'error': 'Email is required in request body'}), 400
+        
+        email = data.get('email')
+        start_date_str = data.get('start_date')
+        end_date_str = data.get('end_date')
+        limit = data.get('limit', 100)
+        
+        # Parse dates if provided
+        start_date = None
+        end_date = None
+        
+        if start_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'error': 'Invalid start_date format. Use YYYY-MM-DD'}), 400
+        
+        if end_date_str:
+            try:
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'error': 'Invalid end_date format. Use YYYY-MM-DD'}), 400
+        
+        # Get PRs from database
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            
+            query = session.query(PRAnalysis).filter_by(author_email=email)
+            
+            if start_date:
+                query = query.filter(PRAnalysis.analyzed_at >= start_date)
+            if end_date:
+                query = query.filter(PRAnalysis.analyzed_at <= end_date)
+            
+            prs = query.order_by(PRAnalysis.analyzed_at.desc()).limit(limit).all()
+            
+            # Format response
+            pr_list = []
+            for pr in prs:
+                pr_list.append({
+                    'pr_number': pr.pr_number,
+                    'pr_title': pr.pr_title,
+                    'pr_url': pr.pr_url,
+                    'repository': pr.repository,
+                    'author_login': pr.author_login,
+                    'author_name': pr.author_name,
+                    'analyzed_at': pr.analyzed_at.isoformat() if pr.analyzed_at else None,
+                    'overall_quality_score': pr.overall_quality_score,
+                    'security_score': pr.security_score,
+                    'maintainability_score': pr.maintainability_score,
+                    'total_issues': pr.total_issues,
+                    'critical_issues': pr.critical_issues,
+                    'high_issues': pr.high_issues,
+                    'medium_issues': pr.medium_issues,
+                    'low_issues': pr.low_issues,
+                    'files_changed': pr.files_changed,
+                    'lines_added': pr.lines_added,
+                    'lines_deleted': pr.lines_deleted,
+                    'estimated_coverage': pr.estimated_coverage
+                })
+            
+            return jsonify({
+                'success': True,
+                'email': email,
+                'total_prs': len(pr_list),
+                'date_range': {
+                    'start': start_date_str,
+                    'end': end_date_str
+                },
+                'prs': pr_list
+            }), 200
+        
+    except Exception as e:
+        logger.error("Failed to fetch PRs by email", error=str(e), email=email)
+        return jsonify({'error': 'Failed to fetch PRs'}), 500
+
+
+@app.route('/api/prs/details', methods=['POST'])
+def get_pr_details():
+    """
+    Get detailed information for a specific PR.
+    
+    Request Body:
+    {
+        "pr_number": 123,
+        "repository": "owner/repo"  // optional, but recommended
+    }
+    
+    Response:
+    {
+        "success": true,
+        "pr": {
+            "pr_number": 123,
+            "pr_title": "Add new feature",
+            "pr_description": "...",
+            "pr_url": "https://github.com/...",
+            "repository": "owner/repo",
+            "author_login": "username",
+            "author_email": "user@example.com",
+            "author_name": "User Name",
+            "base_branch": "main",
+            "head_branch": "feature-branch",
+            "analyzed_at": "2024-12-20T10:30:00Z",
+            "overall_quality_score": 85.5,
+            "security_score": 100.0,
+            "maintainability_score": 90.0,
+            "total_issues": 10,
+            "issues_by_severity": {
+                "critical": 0,
+                "high": 2,
+                "medium": 5,
+                "low": 3
+            },
+            "issues_by_agent": {
+                "static_analysis": 3,
+                "security": 0,
+                "code_quality": 5,
+                "context": 1,
+                "coverage": 1
+            },
+            "code_metrics": {
+                "files_changed": 5,
+                "lines_added": 150,
+                "lines_deleted": 20,
+                "complexity_score": 15.5,
+                "estimated_coverage": 75.0,
+                "test_to_code_ratio": 0.8
+            }
+        },
+        "issues": [
+            {
+                "issue_type": "MAGIC_NUMBER",
+                "severity": "medium",
+                "file_path": "src/main.py",
+                "line_number": 42,
+                "message": "Avoid using magic numbers...",
+                "suggestion": "Use named constants..."
+            },
+            ...
+        ]
+    }
+    """
+    if not db_service:
+        return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        data = request.json
+        
+        if not data or 'pr_number' not in data:
+            return jsonify({'error': 'pr_number is required in request body'}), 400
+        
+        pr_number = data.get('pr_number')
+        repository = data.get('repository')
+        
+        # Get PR from database
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis, PRIssue
+            
+            query = session.query(PRAnalysis).filter_by(pr_number=pr_number)
+            
+            if repository:
+                query = query.filter_by(repository=repository)
+            
+            pr = query.first()
+            
+            if not pr:
+                return jsonify({
+                    'error': 'PR not found',
+                    'pr_number': pr_number,
+                    'repository': repository
+                }), 404
+            
+            # Get issues for this PR
+            issues = session.query(PRIssue).filter_by(pr_analysis_id=pr.id).all()
+            
+            # Format PR details
+            pr_details = {
+                'pr_number': pr.pr_number,
+                'pr_title': pr.pr_title,
+                'pr_description': pr.pr_description,
+                'pr_url': pr.pr_url,
+                'repository': pr.repository,
+                'author_login': pr.author_login,
+                'author_email': pr.author_email,
+                'author_name': pr.author_name,
+                'base_branch': pr.base_branch,
+                'head_branch': pr.head_branch,
+                'analyzed_at': pr.analyzed_at.isoformat() if pr.analyzed_at else None,
+                'pr_created_at': pr.pr_created_at,
+                'pr_updated_at': pr.pr_updated_at,
+                'overall_quality_score': pr.overall_quality_score,
+                'security_score': pr.security_score,
+                'maintainability_score': pr.maintainability_score,
+                'total_issues': pr.total_issues,
+                'issues_by_severity': {
+                    'critical': pr.critical_issues,
+                    'high': pr.high_issues,
+                    'medium': pr.medium_issues,
+                    'low': pr.low_issues
+                },
+                'issues_by_agent': {
+                    'static_analysis': pr.static_analysis_issues,
+                    'security': pr.security_issues,
+                    'code_quality': pr.code_quality_issues,
+                    'context': pr.context_issues,
+                    'coverage': pr.coverage_issues
+                },
+                'code_metrics': {
+                    'files_changed': pr.files_changed,
+                    'lines_added': pr.lines_added,
+                    'lines_deleted': pr.lines_deleted,
+                    'complexity_score': pr.complexity_score,
+                    'estimated_coverage': pr.estimated_coverage,
+                    'test_to_code_ratio': pr.test_to_code_ratio
+                }
+            }
+            
+            # Format issues
+            issue_list = []
+            for issue in issues:
+                issue_list.append({
+                    'issue_type': issue.issue_type,
+                    'severity': issue.severity,
+                    'category': issue.category,
+                    'file_path': issue.file_path,
+                    'line_number': issue.line_number,
+                    'title': issue.title,
+                    'description': issue.description,
+                    'recommendation': issue.recommendation,
+                    'agent_name': issue.agent_name
+                })
+            
+            return jsonify({
+                'success': True,
+                'pr': pr_details,
+                'issues': issue_list,
+                'total_issues': len(issue_list)
+            }), 200
+        
+    except Exception as e:
+        logger.error("Failed to fetch PR details", error=str(e), pr_number=pr_number)
+        return jsonify({'error': 'Failed to fetch PR details'}), 500
+
+
+@app.route('/api/analytics/user', methods=['POST'])
+def get_user_analytics():
+    """
+    Get analytics for a user by email and date range.
+    
+    Request Body:
+    {
+        "email": "user@example.com",
+        "start_date": "2024-01-01",  // optional, format: YYYY-MM-DD
+        "end_date": "2024-12-31"     // optional, format: YYYY-MM-DD
+    }
+    
+    Response:
+    {
+        "success": true,
+        "email": "user@example.com",
+        "author_login": "username",
+        "author_name": "User Name",
+        "analysis_period": {
+            "start_date": "2024-01-01",
+            "end_date": "2024-12-31",
+            "total_prs": 28
+        },
+        "quality_metrics": {
+            "total_prs": 28,
+            "total_issues": 587,
+            "avg_issues_per_pr": 20.96,
+            "severity_distribution": {
+                "critical": 74,
+                "high": 18,
+                "medium": 423,
+                "low": 72
+            }
+        },
+        "code_scores": {
+            "overall_quality": {
+                "average": 82.2,
+                "min": 0.0,
+                "max": 100.0,
+                "rating": "Good"
+            },
+            "security": {
+                "average": 100.0,
+                "min": 100.0,
+                "max": 100.0,
+                "rating": "Excellent"
+            },
+            "maintainability": {
+                "average": 70.8,
+                "min": 10.0,
+                "max": 100.0,
+                "rating": "Fair"
+            }
+        },
+        "best_practices": [
+            {
+                "category": "Security",
+                "title": "Excellent Security Awareness",
+                "description": "You consistently avoid security vulnerabilities",
+                "score": 100.0
+            }
+        ],
+        "bad_practices": [
+            {
+                "category": "Quality",
+                "title": "Magic Number",
+                "occurrences": 458,
+                "severity": "medium"
+            }
+        ],
+        "improvement_recommendations": [
+            {
+                "area": "Overall Code Quality",
+                "priority": "medium",
+                "current_score": 82.2,
+                "target_score": 85,
+                "actions": ["Review and refactor...", ...]
+            }
+        ]
+    }
+    """
+    if not analytics_processing_agent:
+        return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
+    
+    try:
+        data = request.json
+        
+        if not data or 'email' not in data:
+            return jsonify({'error': 'Email is required in request body'}), 400
+        
+        email = data.get('email')
+        start_date_str = data.get('start_date')
+        end_date_str = data.get('end_date')
+        
+        # Parse dates if provided
+        start_date = None
+        end_date = None
+        
+        if start_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'error': 'Invalid start_date format. Use YYYY-MM-DD'}), 400
+        
+        if end_date_str:
+            try:
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'error': 'Invalid end_date format. Use YYYY-MM-DD'}), 400
+        
+        # Get author_login from email
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            
+            pr = session.query(PRAnalysis).filter_by(author_email=email).first()
+            
+            if not pr:
+                return jsonify({
+                    'error': 'No PRs found for this email',
+                    'email': email
+                }), 404
+            
+            author_login = pr.author_login
+            author_name = pr.author_name
+        
+        # Generate analytics
+        analysis = analytics_processing_agent.analyze_user_over_time(
+            author_login=author_login,
+            start_date=start_date,
+            end_date=end_date,
+            min_prs=1
+        )
+        
+        if not analysis.get('success'):
+            return jsonify(analysis), 200
+        
+        # Add email and name to response
+        analysis['email'] = email
+        analysis['author_name'] = author_name
+        
+        return jsonify(analysis), 200
+        
+    except Exception as e:
+        logger.error("Failed to get user analytics", error=str(e), email=email)
+        return jsonify({'error': 'Failed to generate analytics'}), 500
+
+
+@app.route('/api/auto-merge/evaluate', methods=['POST'])
+def evaluate_auto_merge():
+    """
+    Evaluate if a PR should be auto-merged based on configured conditions.
+    
+    Request Body:
+    {
+        "repository": "owner/repo",
+        "pr_number": 123
+    }
+    
+    Returns:
+    {
+        "success": true,
+        "should_merge": true/false,
+        "reason": "Explanation of the decision",
+        "evaluation": {
+            "checks_passed": [...],
+            "checks_failed": [...]
+        },
+        "pr_details": {...}
+    }
+    """
+    try:
+        data = request.json
+        
+        if not data:
+            return jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+        
+        repository = data.get('repository')
+        pr_number = data.get('pr_number')
+        
+        if not repository or not pr_number:
+            return jsonify({'error': ERROR_MISSING_REPO_PR}), 400
+        
+        logger.info(
+            "Evaluating PR for auto-merge",
+            repository=repository,
+            pr_number=pr_number
+        )
+        
+        # Get PR analysis from database
+        if not db_service:
+            return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+        
+        with db_service.get_session() as session:
+            pr_analysis_record = session.query(db_service.PRAnalysis).filter_by(
+                repository=repository,
+                pr_number=pr_number
+            ).first()
+            
+            if not pr_analysis_record:
+                return jsonify({
+                    'error': f'No analysis found for PR #{pr_number} in {repository}'
+                }), 404
+            
+            # Convert to dict
+            pr_analysis = {
+                'scores': {
+                    'overall_quality_score': pr_analysis_record.overall_quality_score,
+                    'security_score': pr_analysis_record.security_score,
+                    'maintainability_score': pr_analysis_record.maintainability_score
+                },
+                'metrics': {
+                    'files_changed': pr_analysis_record.files_changed,
+                    'lines_added': pr_analysis_record.lines_added,
+                    'lines_deleted': pr_analysis_record.lines_deleted
+                },
+                'issues': []
+            }
+            
+            # Get all issues for this PR
+            issues = session.query(db_service.PRIssue).filter_by(
+                pr_analysis_id=pr_analysis_record.id
+            ).all()
+            
+            for issue in issues:
+                pr_analysis['issues'].append({
+                    'severity': issue.severity,
+                    'description': issue.description,
+                    'title': issue.title,
+                    'category': issue.category
+                })
+        
+        # Get PR details from GitHub
+        pr_details = github_service.get_pr_details(repository, pr_number)
+        if not pr_details:
+            return jsonify({'error': 'Failed to fetch PR details from GitHub'}), 500
+        
+        # Add repository info for auto-merge agent
+        pr_details['repository'] = {'full_name': repository}
+        pr_details['number'] = pr_number
+        
+        # Get reviews from GitHub
+        reviews = github_service.get_pr_reviews(repository, pr_number)
+        
+        # Get status checks from GitHub
+        status_checks = github_service.check_pr_status_checks(repository, pr_number)
+        
+        # Evaluate with auto-merge agent
+        should_merge, reason, evaluation = auto_merge_agent.should_auto_merge(
+            pr_analysis=pr_analysis,
+            pr_details=pr_details,
+            reviews=reviews,
+            status_checks=status_checks
+        )
+        
+        response = {
+            'success': True,
+            'should_merge': should_merge,
+            'reason': reason,
+            'evaluation': evaluation,
+            'pr_details': {
+                'repository': repository,
+                'pr_number': pr_number,
+                'title': pr_details.get('title'),
+                'author': pr_details.get('user', {}).get('login'),
+                'state': pr_details.get('state')
+            },
+            'analysis_summary': {
+                'quality_score': pr_analysis['scores']['overall_quality_score'],
+                'security_score': pr_analysis['scores']['security_score'],
+                'total_issues': len(pr_analysis['issues']),
+                'reviews_count': len(reviews),
+                'approvals': sum(1 for r in reviews if r.get('state') == 'APPROVED')
+            }
+        }
+        
+        logger.info(
+            "Auto-merge evaluation complete",
+            repository=repository,
+            pr_number=pr_number,
+            should_merge=should_merge
+        )
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        logger.error("Failed to evaluate auto-merge", error=str(e))
+        return jsonify({'error': 'Failed to evaluate auto-merge'}), 500
+
+
+@app.route('/api/auto-merge/execute', methods=['POST'])
+def execute_auto_merge():
+    """
+    Execute auto-merge for a PR if it passes all conditions.
+    
+    Request Body:
+    {
+        "repository": "owner/repo",
+        "pr_number": 123,
+        "force": false  // Optional: skip condition checks if true (use with caution!)
+    }
+    
+    Returns:
+    {
+        "success": true,
+        "merged": true/false,
+        "message": "Merge result message",
+        "merge_sha": "abc123...",
+        "evaluation": {...}  // Only if force=false
+    }
+    """
+    try:
+        data = request.json
+        
+        if not data:
+            return jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+        
+        repository = data.get('repository')
+        pr_number = data.get('pr_number')
+        force = data.get('force', False)
+        
+        if not repository or not pr_number:
+            return jsonify({'error': ERROR_MISSING_REPO_PR}), 400
+        
+        logger.info(
+            "Executing auto-merge",
+            repository=repository,
+            pr_number=pr_number,
+            force=force
+        )
+        
+        # If not forcing, evaluate conditions first
+        evaluation = None
+        if not force:
+            evaluation_result = _evaluate_pr_for_merge(repository, pr_number)
+            if evaluation_result:
+                return evaluation_result  # Return error response
+            evaluation = evaluation_result
+        
+        # Execute the merge
+        merge_response = _execute_pr_merge(repository, pr_number, evaluation)
+        return merge_response
+        
+    except Exception as e:
+        logger.error("Failed to execute auto-merge", error=str(e))
+        return jsonify({'error': 'Failed to execute auto-merge'}), 500
+
+
+def _evaluate_pr_for_merge(repository: str, pr_number: int):
+    """Evaluate if PR meets auto-merge conditions. Returns error response if it doesn't."""
+    if not db_service:
+        return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+    
+    # Get PR analysis from database
+    pr_analysis = _get_pr_analysis_data(repository, pr_number)
+    if isinstance(pr_analysis, tuple):  # Error response
+        return pr_analysis
+    
+    # Get PR details from GitHub
+    pr_details = github_service.get_pr_details(repository, pr_number)
+    if not pr_details:
+        return jsonify({'error': 'Failed to fetch PR details from GitHub'}), 500
+    
+    pr_details['repository'] = {'full_name': repository}
+    pr_details['number'] = pr_number
+    
+    # Get reviews and status checks
+    reviews = github_service.get_pr_reviews(repository, pr_number)
+    status_checks = github_service.check_pr_status_checks(repository, pr_number)
+    
+    # Evaluate
+    should_merge, reason, evaluation = auto_merge_agent.should_auto_merge(
+        pr_analysis=pr_analysis,
+        pr_details=pr_details,
+        reviews=reviews,
+        status_checks=status_checks
+    )
+    
+    if not should_merge:
+        logger.warning(
+            "PR does not meet auto-merge conditions",
+            repository=repository,
+            pr_number=pr_number,
+            reason=reason
+        )
+        return jsonify({
+            'success': False,
+            'merged': False,
+            'message': f'PR does not meet auto-merge conditions: {reason}',
+            'evaluation': evaluation
+        }), 400
+    
+    return evaluation
+
+
+def _get_pr_analysis_data(repository: str, pr_number: int):
+    """Get PR analysis data from database. Returns error tuple if not found."""
+    with db_service.get_session() as session:
+        pr_analysis_record = session.query(db_service.PRAnalysis).filter_by(
+            repository=repository,
+            pr_number=pr_number
+        ).first()
+        
+        if not pr_analysis_record:
+            return jsonify({
+                'error': f'No analysis found for PR #{pr_number} in {repository}'
+            }), 404
+        
+        # Convert to dict
+        pr_analysis = {
+            'scores': {
+                'overall_quality_score': pr_analysis_record.overall_quality_score,
+                'security_score': pr_analysis_record.security_score,
+                'maintainability_score': pr_analysis_record.maintainability_score
+            },
+            'metrics': {
+                'files_changed': pr_analysis_record.files_changed,
+                'lines_added': pr_analysis_record.lines_added,
+                'lines_deleted': pr_analysis_record.lines_deleted
+            },
+            'issues': []
+        }
+        
+        # Get all issues for this PR
+        issues = session.query(db_service.PRIssue).filter_by(
+            pr_analysis_id=pr_analysis_record.id
+        ).all()
+        
+        for issue in issues:
+            pr_analysis['issues'].append({
+                'severity': issue.severity,
+                'description': issue.description,
+                'title': issue.title,
+                'category': issue.category
+            })
+        
+        return pr_analysis
+
+
+def _execute_pr_merge(repository: str, pr_number: int, evaluation):
+    """Execute the actual PR merge."""
+    # Get merge configuration
+    merge_config = auto_merge_agent.get_merge_config()
+    
+    # Execute merge
+    merge_result = github_service.merge_pr(
+        repository=repository,
+        pr_number=pr_number,
+        merge_method=merge_config['merge_method'],
+        commit_title=f"Auto-merge PR #{pr_number}",
+        commit_message="This PR was automatically merged after passing all quality checks.",
+        delete_branch=merge_config['delete_branch']
+    )
+    
+    # Post comment if configured
+    if merge_result['merged'] and merge_config['post_merge_comment']:
+        _post_merge_success_comment(repository, pr_number, merge_result, merge_config)
+    
+    response = {
+        'success': merge_result['success'],
+        'merged': merge_result['merged'],
+        'message': merge_result['message'],
+        'merge_sha': merge_result.get('sha'),
+        'merge_method': merge_config['merge_method']
+    }
+    
+    if evaluation:
+        response['evaluation'] = evaluation
+    
+    logger.info(
+        "Auto-merge execution complete",
+        repository=repository,
+        pr_number=pr_number,
+        merged=merge_result['merged']
+    )
+    
+    return jsonify(response), 200
+
+
+def _post_merge_success_comment(repository: str, pr_number: int, merge_result: dict, merge_config: dict):
+    """Post a success comment after auto-merge."""
+    comment = f"""✅ **Auto-Merge Successful**
+
+This PR was automatically merged after passing all configured checks:
+- Quality Score: Pass ✓
+- Security Score: Pass ✓
+- Issue Count: Within limits ✓
+- Required Approvals: Met ✓
+
+Merge SHA: `{merge_result.get('sha', 'N/A')}`
+Merge Method: {merge_config['merge_method']}
+"""
+    github_service.post_comment(repository, pr_number, comment)
+
+
+@app.route('/api/auto-merge/config', methods=['GET'])
+def get_auto_merge_config():
+    """
+    Get current auto-merge configuration.
+    
+    Returns:
+    {
+        "enabled": true/false,
+        "mode": "conditional",
+        "conditions": {...},
+        "merge_settings": {...}
+    }
+    """
+    try:
+        config_data = config.get('auto_merge', {})
+        
+        response = {
+            'enabled': config_data.get('enabled', False),
+            'mode': config_data.get('mode', 'conditional'),
+            'conditions': config_data.get('conditions', {}),
+            'merge_settings': {
+                'merge_method': config_data.get('merge_method', 'squash'),
+                'delete_branch': config_data.get('delete_branch', True),
+                'post_merge_comment': config_data.get('post_merge_comment', True)
+            },
+            'allowed_repositories': config_data.get('allowed_repositories', []),
+            'allowed_users': config_data.get('allowed_users', [])
+        }
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        logger.error("Failed to get auto-merge config", error=str(e))
+        return jsonify({'error': 'Failed to get auto-merge configuration'}), 500
+
+
+if __name__ == '__main__':
+    port = config.flask_port
+    logger.info(f"Starting PR Review System on port {port}")
+    logger.info("Main Orchestrator Agent initialized with all sub-agents")
+    
+    if db_persistence_agent:
+        logger.info("Database Persistence Agent ready")
+    if analytics_processing_agent:
+        logger.info("Analytics Processing Agent ready")
+    if auto_merge_agent.enabled:
+        logger.info(f"Auto-Merge Agent ready (mode: {auto_merge_agent.mode})")
+    
+    # Initialize database tables if needed
+    if db_service:
+        try:
+            db_service.create_tables()
+            logger.info("Database tables initialized")
+        except Exception as e:
+            logger.warning("Database tables may already exist", error=str(e))
+    
+    app.run(host='0.0.0.0', port=port, debug=config.get('application.environment') == 'development')

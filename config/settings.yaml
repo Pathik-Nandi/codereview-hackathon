@@ -1,0 +1,198 @@
+application:
+  name: "Multi-Agent PR Review System"
+  version: "1.0.0"
+  environment: "development"
+
+dispatcher:
+  # Dispatch strategy options:
+  # - round_robin: Cycles through agents in order
+  # - file_based: Selects agent based on files changed
+  # - security_first: Always uses security agent if available
+  # - fixed: Always uses the preferred_agent
+  strategy: "file_based"
+  preferred_agent: "static_analysis"  # Used when strategy is 'fixed'
+
+orchestrator:
+  max_parallel_agents: 4
+  timeout_seconds: 300
+  retry_attempts: 3
+
+agents:
+  static_analysis:
+    enabled: true
+    severity_threshold: "medium"
+    languages:
+      python:
+        enabled: true
+        tools: [pylint, flake8]
+      java:
+        enabled: true
+        tools: [checkstyle, pmd]
+      scala:
+        enabled: true
+        tools: [scalastyle, scalafix]
+      javascript:
+        enabled: true
+        tools: [eslint]
+      typescript:
+        enabled: true
+        tools: [eslint, tslint]
+      nodejs:
+        enabled: true
+        tools: [eslint, jshint]
+    
+  security:
+    enabled: true
+    severity_threshold: "low"
+    fail_on_high: true
+    languages:
+      python:
+        enabled: true
+        tools: [bandit, safety]
+      java:
+        enabled: true
+        tools: [spotbugs, dependency-check]
+      scala:
+        enabled: true
+        tools: [spotbugs, dependency-check]
+      javascript:
+        enabled: true
+        tools: [npm-audit, eslint-security]
+      typescript:
+        enabled: true
+        tools: [npm-audit, eslint-security]
+      nodejs:
+        enabled: true
+        tools: [npm-audit, snyk]
+    
+  code_quality:
+    enabled: true
+    complexity_threshold: 10
+    maintainability_threshold: 20
+    languages:
+      python:
+        enabled: true
+        tools: [radon]
+      java:
+        enabled: true
+        tools: [pmd, sonarqube]
+      scala:
+        enabled: true
+        tools: [sonarqube, scalastyle]
+      javascript:
+        enabled: true
+        tools: [eslint, sonarqube]
+      typescript:
+        enabled: true
+        tools: [eslint, sonarqube]
+      nodejs:
+        enabled: true
+        tools: [eslint, sonarqube]
+    
+  context:
+    enabled: true
+    analyze_dependencies: true
+    analyze_test_coverage: true
+    check_breaking_changes: true
+  
+  coverage:
+    enabled: true
+    min_coverage_threshold: 80.0
+    check_coverage: true
+    analyze_complexity: true
+
+feedback_aggregator:
+  prioritize_security: true
+  group_by_severity: true
+  include_suggestions: true
+
+output:
+  github:
+    enabled: true
+    comment_on_pr: true
+    create_review: true
+    request_changes_threshold: "high"
+    
+  slack:
+    enabled: true
+    mention_on_critical: true
+    channel_notifications: true
+    
+  dashboard:
+    enabled: true
+    real_time_updates: true
+    store_history: true
+
+# Database Configuration
+database:
+  enabled: true
+  host: "localhost"
+  port: 5433
+  database: "pr_analysis"
+  username: "postgres"
+  password: "postgres"
+  echo: false  # Set to true for SQL query logging
+  pool_size: 10
+  max_overflow: 20
+  
+# Analytics Configuration
+analytics:
+  enabled: true
+  min_prs_for_insights: 5
+  trend_analysis_threshold: 10
+  top_issues_limit: 10
+  generate_recommendations: true
+
+# Auto-Merge Configuration
+auto_merge:
+  enabled: false  # Set to true to enable auto-merge
+  mode: "conditional"  # Options: conditional, always, never
+  
+  # Conditions that must be met for auto-merge
+  conditions:
+    # Quality score thresholds
+    min_quality_score: 85.0
+    min_security_score: 95.0
+    min_maintainability_score: 70.0
+    
+    # Issue count limits
+    max_critical_issues: 0
+    max_high_issues: 0
+    max_medium_issues: 5
+    max_total_issues: 20
+    
+    # Code review requirements
+    require_approval: true
+    min_approvals: 1
+    
+    # PR metadata requirements
+    require_tests: false
+    require_description: false
+    
+    # File change limits
+    max_files_changed: 50
+    max_lines_changed: 1000
+    
+    # Specific checks
+    check_security_issues: true
+    check_breaking_changes: true
+    allow_wip_prs: false  # Don't auto-merge PRs with [WIP] or draft status
+    
+  # Merge method
+  merge_method: "squash"  # Options: merge, squash, rebase
+  
+  # Post-merge actions
+  delete_branch: true
+  post_merge_comment: true
+  
+  # Repositories allowed for auto-merge (empty = all allowed)
+  allowed_repositories: []
+  # Example:
+  # - "KB-iGOT/cb-ext-course-service"
+  # - "KB-iGOT/cb-ui-assessment"
+  
+  # Users/teams allowed to trigger auto-merge (empty = all allowed)
+  allowed_users: []
+  # Example:
+  # - "ruksana2808"
+  # - "maheshrv"

@@ -3,6 +3,7 @@ import time
 from datetime import datetime, timedelta
 from uuid import UUID
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from functools import wraps
 from models.pr_event import PREvent
 from models.feedback import FeedbackFormatter
@@ -26,6 +27,7 @@ ERROR_MISSING_REPO_PR = 'Missing required fields: repository and pr_number'
 ERROR_AUTH_SERVICE_UNAVAILABLE = 'Authentication service not available'
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # Enable CORS for all API routes
 
 # Initialize components
 dispatcher = AgentDispatcher()
@@ -1053,19 +1055,38 @@ def analyze_user_over_time(author_login: str):
         return jsonify({'error': 'Failed to generate analysis'}), 500
 
 
-@app.route('/api/analytics/user/<author_login>/summary', methods=['GET'])
-def get_user_analytics_summary(author_login: str):
+@app.route('/api/analytics/user/summary', methods=['POST'])
+def get_user_analytics_summary():
     """
     Get quick analytics summary for user (last 30 days by default).
     
-    Query Parameters:
-        - days: Number of days to analyze (default: 30)
+    Request Body:
+        - email: User email (required)
+        - days: Number of days to analyze (optional, default: 30)
     """
     if not analytics_processing_agent:
         return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
     
     try:
-        days = request.args.get('days', 30, type=int)
+        data = request.get_json()
+        if not data or not data.get('email'):
+            return jsonify({'error': 'Email is required in request body'}), 400
+        
+        email = data.get('email')
+        days = data.get('days', 30)
+        
+        # Get author_login from email
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            pr = session.query(PRAnalysis).filter_by(author_email=email).first()
+            if not pr:
+                return jsonify({
+                    'success': False,
+                    'error': f'No PRs found for email: {email}',
+                    'prs_analyzed': 0
+                }), 200
+            author_login = pr.author_login
+        
         start_date = datetime.now() - timedelta(days=days)
         
         analysis = analytics_processing_agent.analyze_user_over_time(
@@ -1081,6 +1102,7 @@ def get_user_analytics_summary(author_login: str):
         # Return condensed summary
         summary = {
             'author_login': author_login,
+            'author_email': email,
             'period_days': days,
             'total_prs': analysis['analysis_period']['total_prs'],
             'code_scores': analysis['code_scores'],
@@ -1096,25 +1118,43 @@ def get_user_analytics_summary(author_login: str):
         return jsonify(summary), 200
         
     except Exception as e:
-        logger.error("Failed to get analytics summary", error=str(e), author=author_login)
+        logger.error("Failed to get analytics summary", error=str(e), email=email)
         return jsonify({'error': 'Failed to generate summary'}), 500
 
 
-@app.route('/api/analytics/user/<author_login>/recommendations', methods=['GET'])
-def get_user_recommendations(author_login: str):
+@app.route('/api/analytics/user/recommendations', methods=['POST'])
+def get_user_recommendations():
     """
     Get personalized improvement recommendations for user.
     
-    Query Parameters:
-        - days: Number of days to analyze (default: 90)
-        - priority: Filter by priority (critical, high, medium, low)
+    Request Body:
+        - email: User email (required)
+        - days: Number of days to analyze (optional, default: 90)
+        - priority: Filter by priority (optional: critical, high, medium, low)
     """
     if not analytics_processing_agent:
         return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
     
     try:
-        days = request.args.get('days', 90, type=int)
-        priority_filter = request.args.get('priority')
+        data = request.get_json()
+        if not data or not data.get('email'):
+            return jsonify({'error': 'Email is required in request body'}), 400
+        
+        email = data.get('email')
+        days = data.get('days', 90)
+        priority_filter = data.get('priority')
+        
+        # Get author_login from email
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            pr = session.query(PRAnalysis).filter_by(author_email=email).first()
+            if not pr:
+                return jsonify({
+                    'success': False,
+                    'error': f'No PRs found for email: {email}',
+                    'prs_analyzed': 0
+                }), 200
+            author_login = pr.author_login
         
         start_date = datetime.now() - timedelta(days=days)
         
@@ -1136,29 +1176,49 @@ def get_user_recommendations(author_login: str):
         
         return jsonify({
             'author_login': author_login,
+            'author_email': email,
             'analysis_period_days': days,
             'total_recommendations': len(recommendations),
             'recommendations': recommendations
         }), 200
         
     except Exception as e:
-        logger.error("Failed to get recommendations", error=str(e), author=author_login)
+        logger.error("Failed to get recommendations", error=str(e), email=email)
         return jsonify({'error': 'Failed to generate recommendations'}), 500
 
 
-@app.route('/api/analytics/user/<author_login>/trends', methods=['GET'])
-def get_user_trends(author_login: str):
+@app.route('/api/analytics/user/trends', methods=['POST'])
+def get_user_trends():
     """
     Get quality trends for user over time.
     
-    Query Parameters:
-        - days: Number of days to analyze (default: 180)
+    Request Body:
+        - email: User email (required)
+        - days: Number of days to analyze (optional, default: 180)
     """
     if not analytics_processing_agent:
         return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
     
     try:
-        days = request.args.get('days', 180, type=int)
+        data = request.get_json()
+        if not data or not data.get('email'):
+            return jsonify({'error': 'Email is required in request body'}), 400
+        
+        email = data.get('email')
+        days = data.get('days', 180)
+        
+        # Get author_login from email
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            pr = session.query(PRAnalysis).filter_by(author_email=email).first()
+            if not pr:
+                return jsonify({
+                    'success': False,
+                    'error': f'No PRs found for email: {email}',
+                    'prs_analyzed': 0
+                }), 200
+            author_login = pr.author_login
+        
         start_date = datetime.now() - timedelta(days=days)
         
         analysis = analytics_processing_agent.analyze_user_over_time(
@@ -1173,13 +1233,14 @@ def get_user_trends(author_login: str):
         
         return jsonify({
             'author_login': author_login,
+            'author_email': email,
             'analysis_period_days': days,
             'trend_analysis': analysis.get('trend_analysis', {}),
             'code_scores': analysis.get('code_scores', {})
         }), 200
         
     except Exception as e:
-        logger.error("Failed to get trends", error=str(e), author=author_login)
+        logger.error("Failed to get trends", error=str(e), email=email)
         return jsonify({'error': 'Failed to generate trends'}), 500
 
 

@@ -25,6 +25,7 @@ ERROR_ANALYTICS_AGENT_UNAVAILABLE = 'Analytics Processing Agent not available'
 ERROR_REQUEST_BODY_REQUIRED = 'Request body is required'
 ERROR_MISSING_REPO_PR = 'Missing required fields: repository and pr_number'
 ERROR_AUTH_SERVICE_UNAVAILABLE = 'Authentication service not available'
+ERROR_EMAIL_REQUIRED = 'Email is required in request body'
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})  # Enable CORS for all API routes
@@ -1070,7 +1071,7 @@ def get_user_analytics_summary():
     try:
         data = request.get_json()
         if not data or not data.get('email'):
-            return jsonify({'error': 'Email is required in request body'}), 400
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
         
         email = data.get('email')
         days = data.get('days', 30)
@@ -1138,7 +1139,7 @@ def get_user_recommendations():
     try:
         data = request.get_json()
         if not data or not data.get('email'):
-            return jsonify({'error': 'Email is required in request body'}), 400
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
         
         email = data.get('email')
         days = data.get('days', 90)
@@ -1202,7 +1203,7 @@ def get_user_trends():
     try:
         data = request.get_json()
         if not data or not data.get('email'):
-            return jsonify({'error': 'Email is required in request body'}), 400
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
         
         email = data.get('email')
         days = data.get('days', 180)
@@ -1289,7 +1290,7 @@ def get_prs_by_email():
         data = request.json
         
         if not data or 'email' not in data:
-            return jsonify({'error': 'Email is required in request body'}), 400
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
         
         email = data.get('email')
         start_date_str = data.get('start_date')
@@ -1621,7 +1622,7 @@ def get_user_analytics():
         data = request.json
         
         if not data or 'email' not in data:
-            return jsonify({'error': 'Email is required in request body'}), 400
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
         
         email = data.get('email')
         start_date_str = data.get('start_date')

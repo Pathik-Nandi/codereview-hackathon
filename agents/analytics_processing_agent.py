@@ -62,7 +62,13 @@ class AnalyticsProcessingAgent:
                 latest_analytics = self.db_service.get_latest_user_analytics(author_login)
                 
                 if latest_analytics:
-                    time_since_last = datetime.now(timezone.utc) - latest_analytics.analysis_date
+                    # Ensure both datetimes are timezone-aware for comparison
+                    analysis_date = latest_analytics.analysis_date
+                    if analysis_date.tzinfo is None:
+                        # If analysis_date is naive, assume it's UTC
+                        analysis_date = analysis_date.replace(tzinfo=timezone.utc)
+                    
+                    time_since_last = datetime.now(timezone.utc) - analysis_date
                     if time_since_last < timedelta(hours=4):
                         logger.info(
                             "Skipping analytics - recent snapshot exists",
@@ -140,7 +146,7 @@ class AnalyticsProcessingAgent:
         Returns:
             Comprehensive analysis with metrics, best practices, recommendations
         """
-        start_time = datetime.now()
+        start_time = datetime.now(timezone.utc)
         
         try:
             # Get user's PRs in date range
@@ -160,7 +166,7 @@ class AnalyticsProcessingAgent:
                 'author_login': author_login,
                 'analysis_period': {
                     'start_date': start_date.isoformat() if start_date else None,
-                    'end_date': end_date.isoformat() if end_date else datetime.now().isoformat(),
+                    'end_date': end_date.isoformat() if end_date else datetime.now(timezone.utc).isoformat(),
                     'total_prs': len(prs)
                 },
                 'quality_metrics': self._calculate_quality_metrics(prs),
@@ -171,10 +177,10 @@ class AnalyticsProcessingAgent:
                 'trend_analysis': self._analyze_trends(prs),
                 'issue_distribution': self._analyze_issue_distribution(prs),
                 'agent_breakdown': self._analyze_agent_performance(prs),
-                'generated_at': datetime.now().isoformat()
+                'generated_at': datetime.now(timezone.utc).isoformat()
             }
             
-            duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+            duration_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
             analysis['processing_time_ms'] = duration_ms
             
             logger.info(

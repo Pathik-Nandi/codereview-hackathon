@@ -1,7 +1,10 @@
 """Main application entry point."""
 import time
 from datetime import datetime, timedelta
+from uuid import UUID
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+from functools import wraps
 from models.pr_event import PREvent
 from models.feedback import FeedbackFormatter
 from agents.dispatcher import AgentDispatcher
@@ -11,6 +14,7 @@ from services.slack_service import SlackService
 from services.dashboard_service import DashboardService
 from services.database_service import DatabaseService
 from services.analytics_service import AnalyticsService
+from services.auth_service import AuthService
 from utils.logger import logger
 from utils.config import config
 
@@ -20,8 +24,11 @@ ERROR_DB_SERVICE_UNAVAILABLE = 'Database service not available'
 ERROR_ANALYTICS_AGENT_UNAVAILABLE = 'Analytics Processing Agent not available'
 ERROR_REQUEST_BODY_REQUIRED = 'Request body is required'
 ERROR_MISSING_REPO_PR = 'Missing required fields: repository and pr_number'
+ERROR_AUTH_SERVICE_UNAVAILABLE = 'Authentication service not available'
+ERROR_EMAIL_REQUIRED = 'Email is required in request body'
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # Enable CORS for all API routes
 
 # Initialize components
 dispatcher = AgentDispatcher()
@@ -33,6 +40,7 @@ auto_merge_agent = AutoMergeAgent()
 # Initialize database services if enabled
 db_service = None
 analytics_service = None
+auth_service = None
 db_persistence_agent = None
 analytics_processing_agent = None
 
@@ -40,6 +48,7 @@ if config.get('database.enabled', False):
     try:
         db_service = DatabaseService()
         analytics_service = AnalyticsService(db_service)
+        auth_service = AuthService(db_service)
         
         # Initialize specialized agents
         from agents.database_persistence_agent import DatabasePersistenceAgent
@@ -63,6 +72,294 @@ def health():
         'version': '1.0.0'
     })
 
+
+# ============================================================================
+# AUTHENTICATION MIDDLEWARE
+# ============================================================================
+
+def require_auth(f):
+    """
+    Decorator to require authentication for an endpoint.
+    Validates JWT token from Authorization header.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not auth_service:
+            return jsonify({'error': ERROR_AUTH_SERVICE_UNAVAILABLE}), 503
+        
+        # Get token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return jsonify({'error': 'Authorization header required'}), 401
+        
+        # Extract token (format: "Bearer <token>")
+        parts = auth_header.split()
+        if len(parts) != 2 or parts[0].lower() != 'bearer':
+            return jsonify({'error': 'Invalid authorization header format. Use: Bearer <token>'}), 401
+        
+        token = parts[1]
+        
+        # Validate token and session
+        is_valid, user_data = auth_service.validate_session(token)
+        if not is_valid:
+            return jsonify({'error': 'Invalid or expired token. Please login again.'}), 401
+        
+        # Add user data to request context
+        request.current_user = user_data
+        
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+
+# ============================================================================
+# AUTHENTICATION ENDPOINTS
+# ============================================================================
+
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    """
+    Register a new user.
+    
+    Request Body:
+    {
+        "username": "john_doe",
+        "email": "john@example.com",
+        "password": "securepassword123",
+        "full_name": "John Doe"  // optional
+    }
+    
+    Response:
+    {
+        "success": true,
+        "message": "User registered successfully",
+        "user": {
+            "user_id": 1,
+            "username": "john_doe",
+            "email": "john@example.com",
+            "full_name": "John Doe",
+            "created_at": "2025-12-21T10:30:00"
+        }
+    }
+    """
+    if not auth_service:
+        return jsonify({'error': ERROR_AUTH_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+        
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
+        full_name = data.get('full_name')
+        
+        # Register user
+        success, message, user_data = auth_service.register_user(
+            username=username,
+            email=email,
+            password=password,
+            full_name=full_name
+        )
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': message,
+                'user': user_data
+            }), 201
+        else:
+            return jsonify({
+                'success': False,
+                'error': message
+            }), 400
+            
+    except Exception as e:
+        logger.error("Registration error", error=str(e))
+        return jsonify({'error': 'Registration failed'}), 500
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    """
+    Login a user and create a session.
+    
+    Request Body:
+    {
+        "email": "john@example.com",
+        "password": "securepassword123"
+    }
+    
+    Response:
+    {
+        "success": true,
+        "message": "Login successful",
+        "session": {
+            "token": "eyJhbGciOiJIUzI1NiIs...",
+            "user_id": 1,
+            "username": "john_doe",
+            "email": "john@example.com",
+            "full_name": "John Doe",
+            "expires_at": "2025-12-22T10:30:00",
+            "session_id": 123
+        }
+    }
+    """
+    if not auth_service:
+        return jsonify({'error': ERROR_AUTH_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+        
+        email = data.get('email')
+        password = data.get('password')
+        
+        if not email or not password:
+            return jsonify({'error': 'Email and password are required'}), 400
+        
+        # Get client information
+        ip_address = request.remote_addr
+        user_agent = request.headers.get('User-Agent')
+        
+        # Login user
+        success, message, session_data = auth_service.login_user(
+            email=email,
+            password=password,
+            ip_address=ip_address,
+            user_agent=user_agent
+        )
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': message,
+                'session': session_data
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': message
+            }), 401
+            
+    except Exception as e:
+        logger.error("Login error", error=str(e))
+        return jsonify({'error': 'Login failed'}), 500
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+@require_auth
+def logout():
+    """
+    Logout a user and invalidate their session.
+    
+    Headers:
+        Authorization: Bearer <token>
+    
+    Response:
+    {
+        "success": true,
+        "message": "Logout successful"
+    }
+    """
+    if not auth_service:
+        return jsonify({'error': ERROR_AUTH_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        # Get token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        token = auth_header.split()[1]
+        
+        # Logout user
+        success, message = auth_service.logout_user(token)
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': message
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': message
+            }), 400
+            
+    except Exception as e:
+        logger.error("Logout error", error=str(e))
+        return jsonify({'error': 'Logout failed'}), 500
+
+
+@app.route('/api/auth/validate', methods=['GET'])
+@require_auth
+def validate_token():
+    """
+    Validate current JWT token and get user information.
+    
+    Headers:
+        Authorization: Bearer <token>
+    
+    Response:
+    {
+        "valid": true,
+        "user": {
+            "user_id": 1,
+            "username": "john_doe",
+            "email": "john@example.com",
+            "full_name": "John Doe",
+            "is_admin": false
+        }
+    }
+    """
+    return jsonify({
+        'valid': True,
+        'user': request.current_user
+    }), 200
+
+
+@app.route('/api/auth/sessions', methods=['GET'])
+@require_auth
+def get_user_sessions():
+    """
+    Get all active sessions for the current user.
+    
+    Headers:
+        Authorization: Bearer <token>
+    
+    Response:
+    {
+        "sessions": [
+            {
+                "session_id": 123,
+                "created_at": "2025-12-21T10:30:00",
+                "expires_at": "2025-12-22T10:30:00",
+                "last_activity": "2025-12-21T15:45:00",
+                "ip_address": "192.168.1.100",
+                "user_agent": "Mozilla/5.0..."
+            }
+        ]
+    }
+    """
+    if not auth_service:
+        return jsonify({'error': ERROR_AUTH_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        user_id = UUID(request.current_user['user_id'])  # Convert string back to UUID
+        sessions = auth_service.get_user_active_sessions(user_id)
+        
+        return jsonify({
+            'sessions': sessions
+        }), 200
+        
+    except Exception as e:
+        logger.error("Error getting user sessions", error=str(e))
+        return jsonify({'error': 'Failed to get sessions'}), 500
+
+
+# ============================================================================
+# PR ANALYSIS ENDPOINTS (Original endpoints below)
+# ============================================================================
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze_pr():
@@ -759,19 +1056,38 @@ def analyze_user_over_time(author_login: str):
         return jsonify({'error': 'Failed to generate analysis'}), 500
 
 
-@app.route('/api/analytics/user/<author_login>/summary', methods=['GET'])
-def get_user_analytics_summary(author_login: str):
+@app.route('/api/analytics/user/summary', methods=['POST'])
+def get_user_analytics_summary():
     """
     Get quick analytics summary for user (last 30 days by default).
     
-    Query Parameters:
-        - days: Number of days to analyze (default: 30)
+    Request Body:
+        - email: User email (required)
+        - days: Number of days to analyze (optional, default: 30)
     """
     if not analytics_processing_agent:
         return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
     
     try:
-        days = request.args.get('days', 30, type=int)
+        data = request.get_json()
+        if not data or not data.get('email'):
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
+        
+        email = data.get('email')
+        days = data.get('days', 30)
+        
+        # Get author_login from email
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            pr = session.query(PRAnalysis).filter_by(author_email=email).first()
+            if not pr:
+                return jsonify({
+                    'success': False,
+                    'error': f'No PRs found for email: {email}',
+                    'prs_analyzed': 0
+                }), 200
+            author_login = pr.author_login
+        
         start_date = datetime.now() - timedelta(days=days)
         
         analysis = analytics_processing_agent.analyze_user_over_time(
@@ -787,6 +1103,7 @@ def get_user_analytics_summary(author_login: str):
         # Return condensed summary
         summary = {
             'author_login': author_login,
+            'author_email': email,
             'period_days': days,
             'total_prs': analysis['analysis_period']['total_prs'],
             'code_scores': analysis['code_scores'],
@@ -802,25 +1119,43 @@ def get_user_analytics_summary(author_login: str):
         return jsonify(summary), 200
         
     except Exception as e:
-        logger.error("Failed to get analytics summary", error=str(e), author=author_login)
+        logger.error("Failed to get analytics summary", error=str(e), email=email)
         return jsonify({'error': 'Failed to generate summary'}), 500
 
 
-@app.route('/api/analytics/user/<author_login>/recommendations', methods=['GET'])
-def get_user_recommendations(author_login: str):
+@app.route('/api/analytics/user/recommendations', methods=['POST'])
+def get_user_recommendations():
     """
     Get personalized improvement recommendations for user.
     
-    Query Parameters:
-        - days: Number of days to analyze (default: 90)
-        - priority: Filter by priority (critical, high, medium, low)
+    Request Body:
+        - email: User email (required)
+        - days: Number of days to analyze (optional, default: 90)
+        - priority: Filter by priority (optional: critical, high, medium, low)
     """
     if not analytics_processing_agent:
         return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
     
     try:
-        days = request.args.get('days', 90, type=int)
-        priority_filter = request.args.get('priority')
+        data = request.get_json()
+        if not data or not data.get('email'):
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
+        
+        email = data.get('email')
+        days = data.get('days', 90)
+        priority_filter = data.get('priority')
+        
+        # Get author_login from email
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            pr = session.query(PRAnalysis).filter_by(author_email=email).first()
+            if not pr:
+                return jsonify({
+                    'success': False,
+                    'error': f'No PRs found for email: {email}',
+                    'prs_analyzed': 0
+                }), 200
+            author_login = pr.author_login
         
         start_date = datetime.now() - timedelta(days=days)
         
@@ -842,29 +1177,49 @@ def get_user_recommendations(author_login: str):
         
         return jsonify({
             'author_login': author_login,
+            'author_email': email,
             'analysis_period_days': days,
             'total_recommendations': len(recommendations),
             'recommendations': recommendations
         }), 200
         
     except Exception as e:
-        logger.error("Failed to get recommendations", error=str(e), author=author_login)
+        logger.error("Failed to get recommendations", error=str(e), email=email)
         return jsonify({'error': 'Failed to generate recommendations'}), 500
 
 
-@app.route('/api/analytics/user/<author_login>/trends', methods=['GET'])
-def get_user_trends(author_login: str):
+@app.route('/api/analytics/user/trends', methods=['POST'])
+def get_user_trends():
     """
     Get quality trends for user over time.
     
-    Query Parameters:
-        - days: Number of days to analyze (default: 180)
+    Request Body:
+        - email: User email (required)
+        - days: Number of days to analyze (optional, default: 180)
     """
     if not analytics_processing_agent:
         return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
     
     try:
-        days = request.args.get('days', 180, type=int)
+        data = request.get_json()
+        if not data or not data.get('email'):
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
+        
+        email = data.get('email')
+        days = data.get('days', 180)
+        
+        # Get author_login from email
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            pr = session.query(PRAnalysis).filter_by(author_email=email).first()
+            if not pr:
+                return jsonify({
+                    'success': False,
+                    'error': f'No PRs found for email: {email}',
+                    'prs_analyzed': 0
+                }), 200
+            author_login = pr.author_login
+        
         start_date = datetime.now() - timedelta(days=days)
         
         analysis = analytics_processing_agent.analyze_user_over_time(
@@ -879,13 +1234,14 @@ def get_user_trends(author_login: str):
         
         return jsonify({
             'author_login': author_login,
+            'author_email': email,
             'analysis_period_days': days,
             'trend_analysis': analysis.get('trend_analysis', {}),
             'code_scores': analysis.get('code_scores', {})
         }), 200
         
     except Exception as e:
-        logger.error("Failed to get trends", error=str(e), author=author_login)
+        logger.error("Failed to get trends", error=str(e), email=email)
         return jsonify({'error': 'Failed to generate trends'}), 500
 
 
@@ -934,7 +1290,7 @@ def get_prs_by_email():
         data = request.json
         
         if not data or 'email' not in data:
-            return jsonify({'error': 'Email is required in request body'}), 400
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
         
         email = data.get('email')
         start_date_str = data.get('start_date')
@@ -1266,7 +1622,7 @@ def get_user_analytics():
         data = request.json
         
         if not data or 'email' not in data:
-            return jsonify({'error': 'Email is required in request body'}), 400
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
         
         email = data.get('email')
         start_date_str = data.get('start_date')

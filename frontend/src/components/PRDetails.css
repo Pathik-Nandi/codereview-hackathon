@@ -401,6 +401,266 @@
   color: white;
 }
 
+/* RAG Insights Styles */
+.rag-insights-container {
+  padding: 10px 0;
+}
+
+.rag-scores-section {
+  margin-bottom: 30px;
+}
+
+.score-cards .rag-card {
+  text-align: center;
+}
+
+.score-cards .rag-card h3 {
+  font-size: 16px;
+  margin-bottom: 15px;
+  color: #555;
+  font-weight: 600;
+}
+
+.score-value.large {
+  font-size: 48px;
+  font-weight: 700;
+  margin: 10px 0;
+}
+
+.score-value.large.high-risk {
+  color: #dc3545;
+}
+
+.score-value.large.medium-risk {
+  color: #ffc107;
+}
+
+.score-value.large.low-risk {
+  color: #28a745;
+}
+
+.score-value.large.high-novelty {
+  color: #17a2b8;
+}
+
+.score-value.large.medium-novelty {
+  color: #6c757d;
+}
+
+.score-value.large.low-novelty {
+  color: #999;
+}
+
+.score-description {
+  font-size: 14px;
+  color: #666;
+  margin-top: 5px;
+}
+
+.rag-section {
+  background: #f8f9fa;
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.rag-section h3 {
+  margin: 0 0 15px 0;
+  color: #333;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.rag-text {
+  color: #555;
+  line-height: 1.6;
+  font-size: 15px;
+}
+
+.rag-text-content {
+  color: #555;
+  line-height: 1.8;
+  font-size: 14px;
+  white-space: pre-wrap;
+}
+
+.similar-prs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.similar-pr-card {
+  background: white;
+  border-radius: 8px;
+  padding: 15px;
+  border-left: 4px solid #007bff;
+  transition: all 0.2s;
+}
+
+.similar-pr-card:hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  transform: translateX(5px);
+}
+
+.similar-pr-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.similar-pr-number {
+  font-weight: 600;
+  color: #007bff;
+  font-size: 16px;
+}
+
+.similarity-score {
+  background: #e7f3ff;
+  color: #0066cc;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.similarity-type {
+  font-size: 13px;
+  color: #666;
+  margin-bottom: 8px;
+}
+
+.lesson-learned,
+.pattern-identified {
+  background: #f0f8ff;
+  padding: 10px;
+  border-radius: 6px;
+  margin-top: 8px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.lesson-learned strong,
+.pattern-identified strong {
+  color: #0066cc;
+}
+
+.recommendations-list {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.recommendation-card {
+  background: white;
+  border-radius: 8px;
+  padding: 18px;
+  border-left: 4px solid #28a745;
+  transition: all 0.2s;
+}
+
+.recommendation-card.priority-high {
+  border-left-color: #dc3545;
+}
+
+.recommendation-card.priority-medium {
+  border-left-color: #ffc107;
+}
+
+.recommendation-card.priority-low {
+  border-left-color: #28a745;
+}
+
+.recommendation-card:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.recommendation-header {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+  align-items: center;
+}
+
+.priority-badge {
+  padding: 4px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.priority-badge.high {
+  background: #fee;
+  color: #dc3545;
+}
+
+.priority-badge.medium {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.priority-badge.low {
+  background: #d4edda;
+  color: #155724;
+}
+
+.recommendation-type {
+  background: #e9ecef;
+  color: #495057;
+  padding: 4px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.recommendation-title {
+  margin: 0 0 10px 0;
+  color: #333;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.recommendation-description {
+  color: #555;
+  line-height: 1.6;
+  margin: 0 0 10px 0;
+  font-size: 14px;
+}
+
+.recommendation-reasoning {
+  background: #f8f9fa;
+  padding: 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #666;
+  font-style: italic;
+}
+
+.recommendation-reasoning strong {
+  color: #495057;
+  font-style: normal;
+}
+
+/* Enhanced RAG Full Text Styling */
+.rag-text-content {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  font-size: 14px;
+  line-height: 1.8;
+  color: #2c3e50;
+}
+
+.rag-text-content strong {
+  color: #2c3e50;
+  font-weight: 600;
+}
+
+/* Format numbered lists and bullet points */
+.rag-text-content::first-line {
+  font-weight: 500;
+}
+
 @media (max-width: 768px) {
   .pr-details-modal {
     padding: 0;
@@ -422,4 +682,13 @@
   .pr-details-footer {
     flex-direction: column;
   }
+
+  .score-value.large {
+    font-size: 36px;
+  }
+
+  .similar-pr-card:hover {
+    transform: none;
+  }
 }
+

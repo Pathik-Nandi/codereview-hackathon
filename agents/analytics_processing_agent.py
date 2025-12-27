@@ -171,6 +171,7 @@ class AnalyticsProcessingAgent:
                 },
                 'quality_metrics': self._calculate_quality_metrics(prs),
                 'code_scores': self._calculate_code_scores(prs),
+                'rag_metrics': self._calculate_rag_metrics(prs),  # NEW: RAG insights
                 'best_practices': self._identify_best_practices(prs),
                 'bad_practices': self._identify_bad_practices(prs),
                 'improvement_recommendations': self._generate_improvement_recommendations(prs),
@@ -690,3 +691,193 @@ class AnalyticsProcessingAgent:
             'LOW_COVERAGE': 'Add unit tests to increase coverage to 80%+'
         }
         return recommendations.get(issue_type, 'Review and refactor this code pattern')
+    
+    def _get_high_risk_prs(self, prs_with_rag: List) -> List[Dict]:
+        """Identify high-risk PRs from RAG analysis."""
+        high_risk_prs = []
+        for pr in prs_with_rag:
+            if (pr.rag_risk_score or 0) > 0.7:
+                high_risk_prs.append({
+                    'pr_number': pr.pr_number,
+                    'title': pr.pr_title,
+                    'risk_score': pr.rag_risk_score,
+                    'analyzed_at': pr.analyzed_at.isoformat() if pr.analyzed_at else None
+                })
+        return high_risk_prs[:5]  # Top 5
+
+    def _get_novel_contributions(self, prs_with_rag: List) -> List[Dict]:
+        """Identify novel contributions from RAG analysis."""
+        novel_contributions = []
+        for pr in prs_with_rag:
+            if (pr.rag_novelty_score or 0) > 0.8:
+                novel_contributions.append({
+                    'pr_number': pr.pr_number,
+                    'title': pr.pr_title,
+                    'novelty_score': pr.rag_novelty_score,
+                    'analyzed_at': pr.analyzed_at.isoformat() if pr.analyzed_at else None
+                })
+        return novel_contributions[:5]  # Top 5
+
+    def _aggregate_patterns(self, prs_with_rag: List) -> List[Dict]:
+        """Aggregate and count patterns from RAG analysis."""
+        all_patterns = []
+        for pr in prs_with_rag:
+            if pr.rag_patterns_identified:
+                if isinstance(pr.rag_patterns_identified, list):
+                    all_patterns.extend(pr.rag_patterns_identified)
+                elif isinstance(pr.rag_patterns_identified, dict):
+                    all_patterns.extend(pr.rag_patterns_identified.keys())
+        
+        patterns_learned = []
+        if all_patterns:
+            pattern_counts = Counter(all_patterns)
+            for pattern, count in pattern_counts.most_common(10):
+                patterns_learned.append({
+                    'pattern': pattern,
+                    'occurrences': count,
+                    'frequency': count / len(prs_with_rag)
+                })
+        return patterns_learned
+
+    def _calculate_basic_rag_stats(self, prs_with_rag: List) -> Dict:
+        """Calculate basic RAG statistics (averages and totals)."""
+        avg_risk = sum(pr.rag_risk_score or 0 for pr in prs_with_rag) / len(prs_with_rag)
+        avg_novelty = sum(pr.rag_novelty_score or 0 for pr in prs_with_rag) / len(prs_with_rag)
+        total_similar = sum(pr.rag_similar_prs_count or 0 for pr in prs_with_rag)
+        total_recommendations = sum(pr.rag_recommendations_count or 0 for pr in prs_with_rag)
+        
+        return {
+            'avg_risk': avg_risk,
+            'avg_novelty': avg_novelty,
+            'total_similar': total_similar,
+            'total_recommendations': total_recommendations
+        }
+
+    def _calculate_rag_metrics(self, prs: List) -> Dict[str, Any]:
+        """
+        Calculate RAG-specific metrics from PRs.
+        
+        Args:
+            prs: List of PRAnalysis objects
+            
+        Returns:
+            Dictionary with RAG metrics and insights
+        """
+        prs_with_rag = [pr for pr in prs if getattr(pr, 'has_rag_insights', False)]
+        
+        if not prs_with_rag:
+            return {
+                'total_insights': 0,
+                'avg_risk_score': None,
+                'avg_novelty_score': None,
+                'total_similar_prs': 0,
+                'total_recommendations': 0,
+                'high_risk_prs': [],
+                'novel_contributions': [],
+                'patterns_learned': [],
+                'insights_summary': None,
+                'risk_trend': None,
+                'novelty_trend': None
+            }
+        
+        # Calculate basic statistics
+        basic_stats = self._calculate_basic_rag_stats(prs_with_rag)
+        
+        # Identify high-risk PRs and novel contributions
+        high_risk_prs = self._get_high_risk_prs(prs_with_rag)
+        novel_contributions = self._get_novel_contributions(prs_with_rag)
+        
+        # Aggregate patterns
+        patterns_learned = self._aggregate_patterns(prs_with_rag)
+        
+        # Calculate trends
+        risk_trend = self._calculate_rag_trend(prs_with_rag, 'rag_risk_score')
+        novelty_trend = self._calculate_rag_trend(prs_with_rag, 'rag_novelty_score')
+        
+        # Create insights summary
+        insights_summary = {
+            'lessons_learned': self._extract_rag_lessons(prs_with_rag),
+            'pitfalls_avoided': self._extract_rag_pitfalls(prs_with_rag),
+            'best_practices': self._extract_rag_best_practices(prs_with_rag)
+        }
+        
+        return {
+            'total_insights': len(prs_with_rag),
+            'avg_risk_score': round(basic_stats['avg_risk'], 3) if basic_stats['avg_risk'] else None,
+            'avg_novelty_score': round(basic_stats['avg_novelty'], 3) if basic_stats['avg_novelty'] else None,
+            'total_similar_prs': basic_stats['total_similar'],
+            'total_recommendations': basic_stats['total_recommendations'],
+            'high_risk_prs': high_risk_prs,
+            'novel_contributions': novel_contributions,
+            'patterns_learned': patterns_learned,
+            'insights_summary': insights_summary,
+            'risk_trend': risk_trend,
+            'novelty_trend': novelty_trend
+        }
+    
+    def _calculate_rag_trend(self, prs: List, metric_field: str) -> Dict[str, Any]:
+        """Calculate trend for a RAG metric."""
+        if len(prs) < 4:
+            return {'direction': 'stable', 'change': 0}
+        
+        # Sort by date
+        sorted_prs = sorted(prs, key=lambda p: p.analyzed_at or datetime.min.replace(tzinfo=timezone.utc))
+        
+        # Split into recent and older
+        split_point = len(sorted_prs) // 2
+        older_prs = sorted_prs[:split_point]
+        recent_prs = sorted_prs[split_point:]
+        
+        # Calculate averages
+        older_avg = sum(getattr(pr, metric_field) or 0 for pr in older_prs) / len(older_prs)
+        recent_avg = sum(getattr(pr, metric_field) or 0 for pr in recent_prs) / len(recent_prs)
+        
+        change = recent_avg - older_avg
+        
+        # Determine direction (for risk, lower is better)
+        if metric_field == 'rag_risk_score':
+            if change < -0.05:
+                direction = 'improving'
+            elif change > 0.05:
+                direction = 'declining'
+            else:
+                direction = 'stable'
+        else:  # novelty
+            if change > 0.05:
+                direction = 'improving'
+            elif change < -0.05:
+                direction = 'declining'
+            else:
+                direction = 'stable'
+        
+        return {
+            'direction': direction,
+            'change': round(change, 3),
+            'recent_avg': round(recent_avg, 3),
+            'older_avg': round(older_avg, 3)
+        }
+    
+    def _extract_rag_lessons(self, prs: List) -> List[str]:
+        """Extract lessons learned from RAG insights."""
+        # This is a simplified version - in production, you'd query rag_insights table
+        lessons = set()
+        for pr in prs[:10]:  # Sample recent PRs
+            if pr.pr_title and 'fix' in pr.pr_title.lower():
+                lessons.add(f"Fixed issue in PR #{pr.pr_number}")
+        return list(lessons)[:5]
+    
+    def _extract_rag_pitfalls(self, prs: List) -> List[str]:
+        """Extract pitfalls from RAG insights."""
+        pitfalls = []
+        high_risk_count = sum(1 for pr in prs if (pr.rag_risk_score or 0) > 0.7)
+        if high_risk_count > 0:
+            pitfalls.append(f"{high_risk_count} high-risk PRs identified in period")
+        return pitfalls[:5]
+    
+    def _extract_rag_best_practices(self, prs: List) -> List[str]:
+        """Extract best practices from RAG insights."""
+        practices = []
+        novel_count = sum(1 for pr in prs if (pr.rag_novelty_score or 0) > 0.8)
+        if novel_count > 0:
+            practices.append(f"{novel_count} novel contributions showing innovation")
+        return practices[:5]

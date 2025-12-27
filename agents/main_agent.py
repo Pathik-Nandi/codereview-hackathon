@@ -8,6 +8,7 @@ from agents.multilanguage_security_agent import MultiLanguageSecurityAgent
 from agents.multilanguage_code_quality_agent import MultiLanguageCodeQualityAgent
 from agents.context_agent import ContextAgent
 from agents.coverage_agent import CoverageAgent
+from agents.rag_enhanced_agent import RAGEnhancedAgent
 from utils.logger import logger
 
 
@@ -17,9 +18,12 @@ class MainAgent(BaseAgent):
     Runs all agents in sequence and aggregates results.
     """
     
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, db_service=None):
         """Initialize the main agent with all sub-agents."""
         super().__init__("Main Orchestrator Agent", config)
+        
+        # Store db_service for RAG agent
+        self.db_service = db_service
         
         # Initialize all specialized agents
         self.agents = []
@@ -59,6 +63,22 @@ class MainAgent(BaseAgent):
             ))
             self.logger.info("Coverage & Metrics Agent enabled")
         
+        # RAG Enhanced Agent (Optional - requires AI provider + vector DB)
+        # Note: RAG includes AI summarization + historical context learning
+        if config.get('rag_enhanced', {}).get('enabled', False):
+            try:
+                if db_service is None:
+                    self.logger.warning("RAG Enhanced Agent requires db_service - skipping initialization")
+                else:
+                    rag_agent = RAGEnhancedAgent(db_service)
+                    if rag_agent.enabled:
+                        self.agents.append(rag_agent)
+                        self.logger.info("RAG Enhanced Agent enabled")
+                    else:
+                        self.logger.warning("RAG Enhanced Agent disabled (dependencies or API key missing)")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize RAG Enhanced Agent: {e}")
+        
         self.logger.info(f"Main Agent initialized with {len(self.agents)} sub-agents")
     
     def _analyze_impl(self, pr_event: PREvent) -> List[Issue]:
@@ -89,11 +109,13 @@ class MainAgent(BaseAgent):
                 # Analyze with this agent
                 agent_result = agent.analyze(pr_event)
                 
-                # Store results (include metrics for database persistence)
+                # Store results (include both metrics and metadata for database persistence)
+                # metrics: standard agent metrics, metadata: custom agent data (e.g., RAG insights)
                 agent_results[agent.name] = {
                     'issues_count': len(agent_result.issues),
                     'issues': agent_result.issues,
-                    'metadata': agent_result.metrics  # Include agent metrics
+                    'metrics': agent_result.metrics,  # Standard metrics
+                    'metadata': agent_result.metadata  # Custom metadata (e.g., RAG data)
                 }
                 
                 # Add to aggregated results

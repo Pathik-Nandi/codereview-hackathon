@@ -187,6 +187,55 @@
   text-decoration: underline;
 }
 
+/* RAG Metrics Styles */
+.pr-rag-metrics {
+  margin: 16px 0;
+  padding-top: 12px;
+  border-top: 1px solid #f0f0f0;
+}
+
+.rag-badge-container {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.rag-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  color: white;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+/* Background color for risk and novelty badges are set dynamically via inline styles */
+
+.rag-badge.similar {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.rag-badge.recommendations {
+  background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+}
+
+.rag-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  opacity: 0.9;
+}
+
+.rag-value {
+  font-weight: 700;
+}
+
+.rag-icon {
+  font-size: 14px;
+}
+
 .pr-list-loading,
 .pr-list-error,
 .pr-list-empty {
@@ -218,5 +267,9 @@
   .pr-stats {
     flex-direction: column;
     gap: 8px;
+  }
+  
+  .rag-badge-container {
+    justify-content: flex-start;
   }
 }

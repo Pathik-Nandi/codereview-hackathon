@@ -1,13 +1,35 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.10
 """
 Script to fetch PRs from GitHub, analyze them using the multi-agent system,
 and persist results to the database.
 
 This script:
 1. Fetches PR data from GitHub API (PRs #1-183)
-2. Runs all agents (static analysis, security, code quality, context, coverage)
+2. Runs all agents (static analysis, security, code quality, context, coverage, RAG)
 3. Persists analysis results to PostgreSQL database
 4. Generates analytics and best practices
+5. **Smart Data Appending:** Checks for existing PRs to avoid duplicates
+
+Environment Variables:
+    GITHUB_REPOSITORY: Repository name (default: from constants)
+    START_PR: Starting PR number (default: 1)
+    END_PR: Ending PR number (default: 183)
+    DELAY_BETWEEN_PRS: Delay between API requests in seconds (default: 1.0)
+    SKIP_EXISTING: Skip PRs already in database (default: true)
+    UPDATE_EXISTING: Update existing PR records (default: false)
+
+Usage:
+    # Default: Process PRs 1-183, skip existing
+    python fetch_and_analyze_prs.py
+    
+    # Process specific range, skip existing
+    START_PR=184 END_PR=200 python fetch_and_analyze_prs.py
+    
+    # Re-analyze and update existing PRs
+    UPDATE_EXISTING=true python fetch_and_analyze_prs.py
+    
+    # Allow duplicate entries (not recommended)
+    SKIP_EXISTING=false python fetch_and_analyze_prs.py
 """
 import os
 import sys
@@ -45,6 +67,9 @@ REPOSITORY = os.getenv('GITHUB_REPOSITORY', DEFAULT_REPOSITORY)
 START_PR = int(os.getenv('START_PR', '1'))
 END_PR = int(os.getenv('END_PR', '183'))
 DELAY_BETWEEN_PRS = float(os.getenv('DELAY_BETWEEN_PRS', str(GITHUB_API_DELAY)))
+# New: Control duplicate handling
+SKIP_EXISTING = os.getenv('SKIP_EXISTING', 'true').lower() == 'true'  # Skip PRs already in DB
+UPDATE_EXISTING = os.getenv('UPDATE_EXISTING', 'false').lower() == 'true'  # Update existing PRs
 
 # API Configuration (use constants)
 BASE_URL = GITHUB_BASE_URL
@@ -57,7 +82,9 @@ stats = {
     'analyzed': 0,
     'persisted': 0,
     'failed': 0,
-    'skipped': 0
+    'skipped': 0,
+    'already_exists': 0,
+    'updated': 0
 }
 
 
@@ -302,61 +329,8 @@ def persist_results(pr_event, analysis_results, db_agent, author_email=None, aut
             print(f"  ✗ Failed to persist to database: {db_result.get('error')}")
             return False
         
-        # Trigger async analytics processing for the user
-        try:
-            import threading
-            
-            def process_analytics_threaded():
-                """Process analytics in a separate thread."""
-                try:
-                    from services.database_service import DatabaseService
-                    from services.analytics_service import AnalyticsService
-                    from agents.analytics_processing_agent import AnalyticsProcessingAgent
-                    
-                    # Initialize services in thread
-                    db_svc = DatabaseService()
-                    analytics_svc = AnalyticsService(db_svc)
-                    analytics_agent = AnalyticsProcessingAgent(db_svc, analytics_svc)
-                    
-                    # Process analytics
-                    result = analytics_agent.process_user_analytics(
-                        author_login=pr_event.author.login,
-                        author_email=author_email,
-                        author_name=author_name
-                    )
-                    
-                    if result.get('success'):
-                        logger.info(
-                            "Analytics processing completed",
-                            author=pr_event.author.login,
-                            analytics_id=result.get('analytics_id')
-                        )
-                    else:
-                        logger.warning(
-                            "Analytics processing had issues",
-                            author=pr_event.author.login,
-                            error=result.get('error')
-                        )
-                except Exception as e:
-                    logger.error(
-                        "Analytics thread failed",
-                        author=pr_event.author.login,
-                        error=str(e)
-                    )
-            
-            # Start analytics in background thread
-            analytics_thread = threading.Thread(
-                target=process_analytics_threaded,
-                daemon=True,
-                name=f"Analytics-{pr_event.author.login}"
-            )
-            analytics_thread.start()
-            print("  ✓ Analytics processing started in background")
-            
-        except Exception as e:
-            # Analytics failure should not block PR processing
-            print(f"  ⚠️  Analytics processing failed to start: {e}")
-            logger.warning(f"Analytics failed for {pr_event.author.login}", error=str(e))
+        # Trigger analytics processing
+        _trigger_analytics_processing(pr_event, author_email, author_name)
         
         return True
         
@@ -366,10 +340,201 @@ def persist_results(pr_event, analysis_results, db_agent, author_email=None, aut
         return False
 
 
-def process_pr(pr_number, dispatcher, db_agent):
+def _trigger_analytics_processing(pr_event, author_email, author_name):
+    """Trigger async analytics processing for the user."""
+    try:
+        import threading
+        
+        def process_analytics_threaded():
+            """Process analytics in a separate thread."""
+            try:
+                from services.database_service import DatabaseService
+                from services.analytics_service import AnalyticsService
+                from agents.analytics_processing_agent import AnalyticsProcessingAgent
+                
+                # Initialize services in thread
+                db_svc = DatabaseService()
+                analytics_svc = AnalyticsService(db_svc)
+                analytics_agent = AnalyticsProcessingAgent(db_svc, analytics_svc)
+                
+                # Process analytics
+                result = analytics_agent.process_user_analytics(
+                    author_login=pr_event.author.login,
+                    author_email=author_email,
+                    author_name=author_name
+                )
+                
+                if result.get('success'):
+                    logger.info(
+                        "Analytics processing completed",
+                        author=pr_event.author.login,
+                        analytics_id=result.get('analytics_id')
+                    )
+                else:
+                    logger.warning(
+                        "Analytics processing had issues",
+                        author=pr_event.author.login,
+                        error=result.get('error')
+                    )
+            except Exception as e:
+                logger.error(
+                    "Analytics thread failed",
+                    author=pr_event.author.login,
+                    error=str(e)
+                )
+        
+        # Start analytics in background thread
+        analytics_thread = threading.Thread(
+            target=process_analytics_threaded,
+            daemon=True,
+            name=f"Analytics-{pr_event.author.login}"
+        )
+        analytics_thread.start()
+        print("  ✓ Analytics processing started in background")
+        
+    except Exception as e:
+        # Analytics failure should not block PR processing
+        print(f"  ⚠️  Analytics processing failed to start: {e}")
+        logger.warning(f"Analytics failed for {pr_event.author.login}", error=str(e))
+
+
+def check_pr_exists(pr_number, db_service):
+    """Check if a PR already exists in the database. Returns (exists, pr_id) tuple."""
+    try:
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            existing = session.query(PRAnalysis).filter_by(
+                repository=REPOSITORY,
+                pr_number=pr_number
+            ).first()
+            if existing:
+                return (True, existing.id)
+            return (False, None)
+    except Exception as e:
+        logger.warning(f"Error checking PR existence: {e}")
+        return (False, None)
+
+
+def update_pr_analysis(pr_id, pr_event, analysis_results, db_service, author_email=None, author_name=None):
+    """Update an existing PR analysis record."""
+    try:
+        print(f"  Updating existing PR analysis (ID: {pr_id})...")
+        
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis, PRIssue, PRMetrics
+            
+            # Get existing PR
+            pr_analysis = session.query(PRAnalysis).get(pr_id)
+            if not pr_analysis:
+                print(f"  ✗ PR analysis ID {pr_id} not found")
+                return False
+            
+            # Convert analysis_results to dict if needed
+            if hasattr(analysis_results, '__dict__'):
+                analysis_dict = vars(analysis_results)
+                # IMPORTANT: Ensure metadata includes agent_breakdown from dispatcher
+                if hasattr(analysis_results, 'metadata') and analysis_results.metadata:
+                    analysis_dict['metadata'] = analysis_results.metadata
+                    if 'agent_breakdown' in analysis_results.metadata:
+                        analysis_dict['agent_breakdown'] = analysis_results.metadata['agent_breakdown']
+            else:
+                analysis_dict = analysis_results
+            
+            # Update fields
+            pr_analysis.pr_title = pr_event.pr_title
+            pr_analysis.pr_description = pr_event.pr_description
+            pr_analysis.author_email = author_email or pr_analysis.author_email
+            pr_analysis.author_name = author_name or pr_analysis.author_name
+            pr_analysis.files_changed = len(pr_event.files)
+            pr_analysis.lines_added = sum(getattr(f, 'additions', 0) or 0 for f in pr_event.files)
+            pr_analysis.lines_deleted = sum(getattr(f, 'deletions', 0) or 0 for f in pr_event.files)
+            pr_analysis.total_issues = analysis_dict.get('issues_found', 0)
+            pr_analysis.overall_quality_score = db_service._calculate_quality_score(analysis_dict)
+            pr_analysis.security_score = db_service._calculate_security_score(analysis_dict)
+            pr_analysis.maintainability_score = db_service._calculate_maintainability_score(analysis_dict)
+            pr_analysis.analyzed_at = datetime.now(timezone.utc)
+            pr_analysis.pr_updated_at = pr_event.updated_at
+            
+            # Update severity counts
+            severity_counts = db_service._count_severities(analysis_dict)
+            pr_analysis.critical_issues = severity_counts.get('critical', 0)
+            pr_analysis.high_issues = severity_counts.get('high', 0)
+            pr_analysis.medium_issues = severity_counts.get('medium', 0)
+            pr_analysis.low_issues = severity_counts.get('low', 0)
+            
+            # Delete old issues and metrics
+            session.query(PRIssue).filter_by(pr_analysis_id=pr_id).delete()
+            session.query(PRMetrics).filter_by(pr_analysis_id=pr_id).delete()
+            
+            # Save new issues and metrics
+            db_service._save_issues(session, pr_id, analysis_dict)
+            db_service._save_metrics(session, pr_id, analysis_dict)
+            
+            # Update RAG insights
+            db_service.rag_service.save_rag_insights(session, pr_id, analysis_dict)
+            
+            session.commit()
+            print(f"  ✓ Updated PR analysis (ID: {pr_id})")
+            
+            # Trigger analytics processing
+            _trigger_analytics_processing(pr_event, author_email, author_name)
+            
+            return True
+            
+    except Exception as e:
+        print(f"  ✗ Error updating PR analysis: {e}")
+        logger.error(f"Update failed for PR #{pr_event.pr_number}", error=str(e))
+        return False
+
+
+def _handle_existing_pr(pr_number, existing_pr_id):
+    """Handle logic for existing PRs based on configuration flags."""
+    if SKIP_EXISTING and not UPDATE_EXISTING:
+        print(f"  ⏭️  PR #{pr_number} already exists in database (ID: {existing_pr_id}). Skipping...")
+        stats['already_exists'] += 1
+        return 'skip'
+    elif UPDATE_EXISTING:
+        print(f"  � PR #{pr_number} exists. Will update (ID: {existing_pr_id})...")
+        return 'update'
+    else:
+        print(f"  ⚠️  PR #{pr_number} already exists. Re-processing (will create duplicate)...")
+        return 'create'
+
+
+def _persist_pr_results(pr_number, pr_event, analysis_results, db_agent, db_service, existing_pr_id, author_email, author_name, action):
+    """Persist PR results to database (create or update)."""
+    if action == 'update':
+        if update_pr_analysis(existing_pr_id, pr_event, analysis_results, db_service, author_email, author_name):
+            stats['updated'] += 1
+            stats['persisted'] += 1
+            print(f"  ✓ PR #{pr_number} updated successfully")
+            return True
+        else:
+            stats['failed'] += 1
+            return False
+    else:  # action == 'create'
+        if persist_results(pr_event, analysis_results, db_agent, author_email, author_name):
+            stats['persisted'] += 1
+            print(f"  ✓ PR #{pr_number} completed successfully")
+            return True
+        else:
+            stats['failed'] += 1
+            return False
+
+
+def process_pr(pr_number, dispatcher, db_agent, db_service):
     """Fetch, analyze, and persist a single PR."""
     try:
         print(f"\n📋 Processing PR #{pr_number}...")
+        
+        # Check if PR already exists in database
+        exists, existing_pr_id = check_pr_exists(pr_number, db_service)
+        if exists:
+            action = _handle_existing_pr(pr_number, existing_pr_id)
+            if action == 'skip':
+                return True  # Count as successful (already processed)
+        else:
+            action = 'create'
         
         # Step 1: Fetch from GitHub
         pr_data = fetch_pr_from_github(pr_number)
@@ -401,19 +566,68 @@ def process_pr(pr_number, dispatcher, db_agent):
         author_email = pr_data.get('user', {}).get('email')
         author_name = pr_data.get('user', {}).get('name') or pr_event.author.login
         
-        if persist_results(pr_event, analysis_results, db_agent, author_email, author_name):
-            stats['persisted'] += 1
-            print(f"  ✓ PR #{pr_number} completed successfully")
-            return True
-        else:
-            stats['failed'] += 1
-            return False
+        return _persist_pr_results(
+            pr_number, pr_event, analysis_results, db_agent, db_service,
+            existing_pr_id if exists else None, author_email, author_name, action
+        )
         
     except Exception as e:
         print(f"  ✗ Error processing PR #{pr_number}: {e}")
         logger.error(f"Processing failed for PR #{pr_number}", error=str(e))
         stats['failed'] += 1
         return False
+
+
+def _initialize_services():
+    """Initialize database service, dispatcher, and agents."""
+    print("\n🔧 Initializing services...")
+    try:
+        db_service = DatabaseService()
+        dispatcher = AgentDispatcher(db_service=db_service)
+        db_agent = DatabasePersistenceAgent(db_service)
+        print("✓ Services initialized")
+        return db_service, dispatcher, db_agent
+    except Exception as e:
+        print(f"❌ Error initializing services: {e}")
+        sys.exit(1)
+
+
+def _get_processing_mode():
+    """Determine and return the current processing mode string."""
+    if SKIP_EXISTING and not UPDATE_EXISTING:
+        return "Skip existing PRs (append new data only)"
+    elif UPDATE_EXISTING:
+        return "Update existing PRs (re-analyze)"
+    else:
+        return "Allow duplicates (create new records)"
+
+
+def _print_summary(elapsed_time):
+    """Print processing summary statistics."""
+    print("\n" + "=" * 80)
+    print("📊 SUMMARY")
+    print("=" * 80)
+    print(f"Total PRs to process:  {stats['total']}")
+    print(f"Successfully fetched:  {stats['fetched']}")
+    print(f"Successfully analyzed: {stats['analyzed']}")
+    print(f"Successfully persisted: {stats['persisted']}")
+    print(f"Already existed (skipped): {stats['already_exists']}")
+    print(f"Updated existing PRs:  {stats['updated']}")
+    print(f"Skipped (not found):   {stats['skipped']}")
+    print(f"Failed:                {stats['failed']}")
+    print(f"Elapsed time:          {elapsed_time:.1f} seconds ({elapsed_time/60:.1f} minutes)")
+    print("=" * 80)
+    
+    if stats['persisted'] > 0 or stats['already_exists'] > 0:
+        print(f"\n✓ Successfully processed {stats['persisted']} PRs!")
+        if stats['already_exists'] > 0:
+            print(f"  {stats['already_exists']} PRs already existed in database")
+        if stats['updated'] > 0:
+            print(f"  {stats['updated']} PRs were updated")
+        print("  Data persisted to database: pr_analysis")
+        print(f"  Local backups saved to: {OUTPUT_DIR}/")
+    else:
+        print("\n⚠️  No PRs were successfully processed")
 
 
 def main():
@@ -437,25 +651,17 @@ def main():
         sys.exit(1)
     
     # Initialize services
-    print("\n🔧 Initializing services...")
-    try:
-        db_service = DatabaseService()
-        dispatcher = AgentDispatcher()
-        db_agent = DatabasePersistenceAgent(db_service)
-        # Note: Analytics processing is now handled via Celery async tasks
-        print("✓ Services initialized")
-    except Exception as e:
-        print(f"❌ Error initializing services: {e}")
-        sys.exit(1)
+    db_service, dispatcher, db_agent = _initialize_services()
     
     # Process PRs
     print(f"\n🚀 Starting to process {END_PR - START_PR + 1} PRs...\n")
+    print(f"Mode: {_get_processing_mode()}\n")
     
     start_time = time.time()
     stats['total'] = END_PR - START_PR + 1
     
     for pr_number in range(START_PR, END_PR + 1):
-        process_pr(pr_number, dispatcher, db_agent)
+        process_pr(pr_number, dispatcher, db_agent, db_service)
         
         # Delay between requests to respect rate limits
         if pr_number < END_PR:
@@ -466,25 +672,7 @@ def main():
             check_rate_limit()
     
     # Summary
-    elapsed_time = time.time() - start_time
-    print("\n" + "=" * 80)
-    print("📊 SUMMARY")
-    print("=" * 80)
-    print(f"Total PRs to process: {stats['total']}")
-    print(f"Successfully fetched:  {stats['fetched']}")
-    print(f"Successfully analyzed: {stats['analyzed']}")
-    print(f"Successfully persisted: {stats['persisted']}")
-    print(f"Skipped (not found):   {stats['skipped']}")
-    print(f"Failed:                {stats['failed']}")
-    print(f"Elapsed time:          {elapsed_time:.1f} seconds ({elapsed_time/60:.1f} minutes)")
-    print("=" * 80)
-    
-    if stats['persisted'] > 0:
-        print(f"\n✓ Successfully processed {stats['persisted']} PRs!")
-        print("  Data persisted to database: pr_analysis")
-        print(f"  Local backups saved to: {OUTPUT_DIR}/")
-    else:
-        print("\n⚠️  No PRs were successfully processed")
+    _print_summary(time.time() - start_time)
 
 
 if __name__ == '__main__':

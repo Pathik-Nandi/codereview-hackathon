@@ -50,6 +50,28 @@
   margin: 0 0 24px 0;
 }
 
+/* Summary Text Section */
+.summary-text-section {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  padding: 24px;
+  border-radius: 12px;
+  margin-bottom: 32px;
+  box-shadow: 0 4px 15px rgba(102, 126, 234, 0.2);
+}
+
+.summary-text-content {
+  color: white;
+  font-size: 15px;
+  line-height: 1.8;
+  white-space: pre-wrap;
+  font-weight: 400;
+  letter-spacing: 0.3px;
+}
+
+.summary-text-content strong {
+  font-weight: 600;
+}
+
 .section-icon {
   font-size: 28px;
 }
@@ -1070,3 +1092,48 @@
     align-items: flex-start;
   }
 }
+
+/* RAG Metrics Styling */
+.card-icon.rag {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.practice-item.pattern {
+  background: #f0f4ff;
+  border-left: 4px solid #667eea;
+}
+
+.practice-item.pattern:hover {
+  background: #e6edff;
+}
+
+.trends-section {
+  margin-top: 20px;
+  padding: 16px;
+  background: #f8f9fa;
+  border-radius: 10px;
+}
+
+.trends-section h4 {
+  margin: 0 0 15px 0;
+  color: #333;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.trend-items {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.trend-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  background: white;
+  border-radius: 6px;
+  border: 1px solid #e0e0e0;
+}
+

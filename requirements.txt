@@ -41,3 +41,27 @@ alembic==1.13.1
 PyJWT==2.8.0
 passlib==1.7.4
 bcrypt==4.1.2
+
+# AI/LLM Integration (Optional - install based on your choice)
+# For Google Gemini (Recommended - has free tier)
+google-generativeai==0.3.2
+
+# For OpenAI GPT
+openai==1.7.0
+
+# For Anthropic Claude (Alternative)
+# anthropic==0.8.1
+
+# For LangChain (Advanced AI orchestration)
+# langchain==0.1.0
+
+# RAG (Retrieval-Augmented Generation) Dependencies
+# Vector database for semantic search
+chromadb==0.4.22
+
+# Embeddings model for RAG
+sentence-transformers==2.3.1
+
+# Additional ML dependencies for RAG
+torch==2.1.2  # Required by sentence-transformers
+numpy==1.24.3

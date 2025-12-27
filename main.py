@@ -5,6 +5,7 @@ from uuid import UUID
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from functools import wraps
+from sqlalchemy import text
 from models.pr_event import PREvent
 from models.feedback import FeedbackFormatter
 from agents.dispatcher import AgentDispatcher
@@ -30,14 +31,7 @@ ERROR_EMAIL_REQUIRED = 'Email is required in request body'
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})  # Enable CORS for all API routes
 
-# Initialize components
-dispatcher = AgentDispatcher()
-github_service = GitHubService()
-slack_service = SlackService()
-dashboard_service = DashboardService()
-auto_merge_agent = AutoMergeAgent()
-
-# Initialize database services if enabled
+# Initialize database services first (needed by dispatcher for RAG)
 db_service = None
 analytics_service = None
 auth_service = None
@@ -61,6 +55,13 @@ if config.get('database.enabled', False):
     except Exception as e:
         logger.error("Failed to initialize database services", error=str(e))
         logger.warning("Running without database persistence")
+
+# Initialize components (after db_service for RAG support)
+dispatcher = AgentDispatcher(db_service=db_service)
+github_service = GitHubService()
+slack_service = SlackService()
+dashboard_service = DashboardService()
+auto_merge_agent = AutoMergeAgent()
 
 
 @app.route('/health', methods=['GET'])
@@ -810,17 +811,27 @@ def get_user_insights(author_login: str):
         return jsonify({'error': 'Failed to generate insights'}), 500
 
 
-@app.route('/api/dashboard/user/<author_login>/statistics', methods=['GET'])
-def get_user_statistics(author_login: str):
-    """Get user statistics summary."""
+@app.route('/api/dashboard/user/<author_identifier>/statistics', methods=['GET'])
+def get_user_statistics(author_identifier: str):
+    """
+    Get user statistics summary.
+    Accepts either author_login (username) or email address.
+    """
     if not db_service:
         return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
     
     try:
-        user_stats = db_service.get_user_statistics(author_login)
-        
-        if not user_stats:
-            return jsonify({'error': 'User not found'}), 404
+        # Check if author_identifier is an email (contains @)
+        if '@' in author_identifier:
+            # It's an email - use the dedicated email method
+            user_stats = db_service.get_user_statistics_by_email(author_identifier)
+            if not user_stats:
+                return jsonify({'error': f'No user found with email: {author_identifier}'}), 404
+        else:
+            # It's a username
+            user_stats = db_service.get_user_statistics(author_identifier)
+            if not user_stats:
+                return jsonify({'error': 'User not found'}), 404
         
         return jsonify({
             'author_login': user_stats.author_login,
@@ -840,7 +851,22 @@ def get_user_statistics(author_login: str):
             'trends': {
                 'quality': user_stats.quality_trend,
                 'security': user_stats.security_trend,
-                'coverage': user_stats.coverage_trend
+                'coverage': user_stats.coverage_trend,
+                'rag_risk': user_stats.rag_risk_trend,
+                'rag_novelty': user_stats.rag_novelty_trend
+            },
+            # RAG Metrics
+            'rag_metrics': {
+                'total_insights': user_stats.total_rag_insights,
+                'avg_risk_score': user_stats.avg_rag_risk_score,
+                'avg_novelty_score': user_stats.avg_rag_novelty_score,
+                'total_similar_prs_referenced': user_stats.total_similar_prs_referenced,
+                'total_recommendations': user_stats.total_rag_recommendations,
+                'total_patterns_identified': user_stats.total_patterns_identified,
+                'high_risk_prs_count': user_stats.high_risk_prs_count,
+                'novel_prs_count': user_stats.novel_prs_count,
+                'most_common_patterns': user_stats.most_common_patterns,
+                'learning_velocity': user_stats.learning_velocity
             },
             'common_issues': user_stats.common_issues,
             'improvement_areas': user_stats.improvement_areas,
@@ -1056,6 +1082,68 @@ def analyze_user_over_time(author_login: str):
         return jsonify({'error': 'Failed to generate analysis'}), 500
 
 
+def _determine_quality_level(quality_score):
+    """Determine quality level and description from score."""
+    if quality_score >= 90:
+        return "excellent", "outstanding"
+    elif quality_score >= 80:
+        return "very good", "strong"
+    elif quality_score >= 70:
+        return "good", "solid"
+    elif quality_score >= 60:
+        return "fair", "moderate"
+    else:
+        return "needs improvement", "developing"
+
+
+def _determine_security_description(security_score):
+    """Determine security description from score."""
+    if security_score >= 95:
+        return "exemplary security practices"
+    elif security_score >= 85:
+        return "strong security standards"
+    elif security_score >= 75:
+        return "good security awareness"
+    else:
+        return "some security concerns"
+
+
+def _get_trend_text(quality_trend):
+    """Get trend description text."""
+    # Handle if quality_trend is a dict or other type
+    if isinstance(quality_trend, dict):
+        quality_trend = quality_trend.get('direction', 'stable')
+    quality_trend_str = str(quality_trend) if quality_trend else 'stable'
+    
+    if 'improv' in quality_trend_str.lower() or 'up' in quality_trend_str.lower():
+        return " Your code quality is showing positive improvement over time."
+    elif 'declin' in quality_trend_str.lower() or 'down' in quality_trend_str.lower():
+        return " Recent PRs show a declining quality trend that needs attention."
+    else:
+        return " Your code quality is maintaining a consistent level."
+
+
+def _build_summary_text(days, total_prs, quality_level, quality_desc, quality_score, 
+                        security_desc, security_score, avg_issues, trend_text, 
+                        best_practices, bad_practices):
+    """Build narrative summary text from analysis data."""
+    summary_text = f"""Over the past {days} days, you have contributed {total_prs} pull requests with {quality_level} overall quality (average score: {quality_score:.1f}/100). Your contributions demonstrate {quality_desc} coding practices with {security_desc} (security score: {security_score:.1f}/100).
+
+On average, your PRs contain {avg_issues:.1f} issues that are identified during code review.{trend_text}"""
+    
+    # Add best practices note
+    if best_practices and len(best_practices) > 0:
+        bp_names = ', '.join([bp if isinstance(bp, str) else bp.get('title', bp.get('category', 'N/A')) for bp in best_practices[:3]])
+        summary_text += f"\n\nYour strongest areas include: {bp_names}."
+    
+    # Add improvement areas
+    if bad_practices and len(bad_practices) > 0:
+        bad_names = ', '.join([bp if isinstance(bp, str) else bp.get('title', bp.get('category', 'N/A')) for bp in bad_practices[:3]])
+        summary_text += f"\n\nAreas for improvement: {bad_names}."
+    
+    return summary_text
+
+
 @app.route('/api/analytics/user/summary', methods=['POST'])
 def get_user_analytics_summary():
     """
@@ -1100,7 +1188,28 @@ def get_user_analytics_summary():
         if not analysis.get('success'):
             return jsonify(analysis), 200
         
-        # Return condensed summary
+        # Extract metrics
+        quality_score = analysis['code_scores'].get('overall_quality', {}).get('average', 0)
+        security_score = analysis['code_scores'].get('security', {}).get('average', 0)
+        total_prs = analysis['analysis_period']['total_prs']
+        avg_issues = analysis['quality_metrics']['avg_issues_per_pr']
+        
+        # Determine quality and security levels
+        quality_level, quality_desc = _determine_quality_level(quality_score)
+        security_desc = _determine_security_description(security_score)
+        
+        # Get trend text
+        quality_trend = analysis.get('trend_analysis', {}).get('quality', 'stable')
+        trend_text = _get_trend_text(quality_trend)
+        
+        # Build summary text
+        summary_text = _build_summary_text(
+            days, total_prs, quality_level, quality_desc, quality_score,
+            security_desc, security_score, avg_issues, trend_text,
+            analysis['best_practices'], analysis['bad_practices']
+        )
+        
+        # Return condensed summary with narrative text
         summary = {
             'author_login': author_login,
             'author_email': email,
@@ -1113,7 +1222,8 @@ def get_user_analytics_summary():
             },
             'top_best_practices': analysis['best_practices'][:3],
             'top_bad_practices': analysis['bad_practices'][:3],
-            'trends': analysis.get('trend_analysis', {})
+            'trends': analysis.get('trend_analysis', {}),
+            'summary_text': summary_text
         }
         
         return jsonify(summary), 200
@@ -1348,7 +1458,13 @@ def get_prs_by_email():
                     'files_changed': pr.files_changed,
                     'lines_added': pr.lines_added,
                     'lines_deleted': pr.lines_deleted,
-                    'estimated_coverage': pr.estimated_coverage
+                    'estimated_coverage': pr.estimated_coverage,
+                    # RAG Metrics
+                    'has_rag_insights': pr.has_rag_insights,
+                    'rag_risk_score': pr.rag_risk_score,
+                    'rag_novelty_score': pr.rag_novelty_score,
+                    'rag_similar_prs_count': pr.rag_similar_prs_count,
+                    'rag_recommendations_count': pr.rag_recommendations_count
                 })
             
             return jsonify({
@@ -1365,6 +1481,123 @@ def get_prs_by_email():
     except Exception as e:
         logger.error("Failed to fetch PRs by email", error=str(e), email=email)
         return jsonify({'error': 'Failed to fetch PRs'}), 500
+
+
+def _fetch_rag_table_data(session, pr_id):
+    """Fetch RAG insights from database tables."""
+    rag_result = session.execute(
+        text("""
+            SELECT id, risk_score, novelty_score, complexity_assessment, 
+                   summary, recommendations, lessons_learned, 
+                   potential_pitfalls, best_practices_suggested,
+                   context_used, similar_prs_found, similar_prs_referenced
+            FROM rag_insights 
+            WHERE pr_analysis_id = :pr_id
+        """),
+        {'pr_id': pr_id}
+    ).fetchone()
+    return rag_result
+
+
+def _fetch_similar_prs(session, rag_insight_id):
+    """Fetch similar PR references."""
+    return session.execute(
+        text("""
+            SELECT referenced_pr_analysis_id, similarity_score, 
+                   similarity_type, lesson_extracted, pattern_identified
+            FROM rag_similar_pr_references 
+            WHERE rag_insight_id = :insight_id
+        """),
+        {'insight_id': rag_insight_id}
+    ).fetchall()
+
+
+def _fetch_rag_recommendations(session, rag_insight_id):
+    """Fetch RAG recommendations."""
+    return session.execute(
+        text("""
+            SELECT recommendation_type, priority, title, 
+                   description, reasoning
+            FROM rag_recommendations 
+            WHERE rag_insight_id = :insight_id
+        """),
+        {'insight_id': rag_insight_id}
+    ).fetchall()
+
+
+def _build_rag_insights_data(session, pr, rag_result, similar_prs_result, recommendations_result, rag_json):
+    """Build RAG insights data structure from table and JSON data."""
+    from models.database import PRAnalysis
+    
+    return {
+        'risk_score': rag_result[1] or pr.rag_risk_score,
+        'novelty_score': rag_result[2] or pr.rag_novelty_score,
+        'complexity_assessment': rag_result[3],
+        'full_text': rag_json.get('full_text', ''),
+        'summary': rag_result[4] or rag_json.get('summary', ''),
+        'recommendations': rag_result[5] or rag_json.get('recommendations', ''),
+        'lessons_learned': rag_result[6] or rag_json.get('lessons_learned', ''),
+        'potential_pitfalls': rag_result[7] or rag_json.get('potential_pitfalls', ''),
+        'best_practices_suggested': rag_result[8] or rag_json.get('best_practices', ''),
+        'context_used': rag_result[9] if rag_result[9] is not None else rag_json.get('context_used', False),
+        'similar_prs_found': rag_result[10] or rag_json.get('similar_prs_found', 0),
+        'similar_prs_referenced': rag_result[11] or rag_json.get('similar_prs_referenced', 0),
+        'generated_at': rag_json.get('generated_at'),
+        'similar_prs': [
+            {
+                'pr_number': session.query(PRAnalysis).get(ref[0]).pr_number if ref[0] and session.query(PRAnalysis).get(ref[0]) else None,
+                'similarity_score': ref[1],
+                'similarity_type': ref[2],
+                'lesson_extracted': ref[3],
+                'pattern_identified': ref[4]
+            } for ref in similar_prs_result
+        ],
+        'detailed_recommendations': [
+            {
+                'type': rec[0],
+                'priority': rec[1],
+                'title': rec[2],
+                'description': rec[3],
+                'reasoning': rec[4]
+            } for rec in recommendations_result
+        ]
+    }
+
+
+def _get_rag_insights(session, pr):
+    """Get RAG insights for a PR from database and JSON field."""
+    if not pr.has_rag_insights:
+        return None
+    
+    try:
+        rag_json = pr.rag_insights or {}
+        rag_result = _fetch_rag_table_data(session, pr.id)
+        
+        if rag_result:
+            rag_insight_id = rag_result[0]
+            similar_prs_result = _fetch_similar_prs(session, rag_insight_id)
+            recommendations_result = _fetch_rag_recommendations(session, rag_insight_id)
+            
+            return _build_rag_insights_data(
+                session, pr, rag_result, similar_prs_result, 
+                recommendations_result, rag_json
+            )
+        else:
+            # If no table data, use JSON field entirely
+            rag_insights_data = rag_json.copy()
+            rag_insights_data['risk_score'] = pr.rag_risk_score
+            rag_insights_data['novelty_score'] = pr.rag_novelty_score
+            return rag_insights_data
+            
+    except Exception as e:
+        logger.error(f"Error fetching RAG insights: {e}")
+        # Fall back to using pr.rag_insights JSON field if available
+        if pr.rag_insights:
+            rag_insights_data = pr.rag_insights.copy()
+            rag_insights_data['risk_score'] = pr.rag_risk_score
+            rag_insights_data['novelty_score'] = pr.rag_novelty_score
+            return rag_insights_data
+        return None
 
 
 @app.route('/api/prs/details', methods=['POST'])
@@ -1465,6 +1698,9 @@ def get_pr_details():
             # Get issues for this PR
             issues = session.query(PRIssue).filter_by(pr_analysis_id=pr.id).all()
             
+            # Get RAG insights if available
+            rag_insights_data = _get_rag_insights(session, pr)
+            
             # Format PR details
             pr_details = {
                 'pr_number': pr.pr_number,
@@ -1504,7 +1740,9 @@ def get_pr_details():
                     'complexity_score': pr.complexity_score,
                     'estimated_coverage': pr.estimated_coverage,
                     'test_to_code_ratio': pr.test_to_code_ratio
-                }
+                },
+                # RAG Insights
+                'rag_insights': rag_insights_data
             }
             
             # Format issues

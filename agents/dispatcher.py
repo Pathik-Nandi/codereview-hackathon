@@ -12,13 +12,14 @@ class AgentDispatcher:
     Dispatches PR analysis to the main agent which internally runs all agents.
     """
     
-    def __init__(self):
+    def __init__(self, db_service=None):
         """Initialize the agent dispatcher with main agent."""
         self.logger = logger.bind(component="agent_dispatcher")
         
         # Initialize the main orchestrator agent
         # It will internally manage all specialized agents
-        self.main_agent = MainAgent(config.get('agents', {}))
+        # Pass db_service for RAG agent
+        self.main_agent = MainAgent(config.get('agents', {}), db_service=db_service)
         
         self.logger.info(
             "Agent dispatcher initialized with Main Orchestrator Agent"

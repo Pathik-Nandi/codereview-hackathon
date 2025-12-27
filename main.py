@@ -1483,7 +1483,6 @@ def get_prs_by_email():
         return jsonify({'error': 'Failed to fetch PRs'}), 500
 
 
-@app.route('/api/prs/details', methods=['POST'])
 def _fetch_rag_table_data(session, pr_id):
     """Fetch RAG insights from database tables."""
     rag_result = session.execute(
@@ -1601,6 +1600,7 @@ def _get_rag_insights(session, pr):
         return None
 
 
+@app.route('/api/prs/details', methods=['POST'])
 def get_pr_details():
     """
     Get detailed information for a specific PR.

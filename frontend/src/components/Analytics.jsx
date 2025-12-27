@@ -24,7 +24,8 @@ const Analytics = ({ userEmail }) => {
   const [data, setData] = useState({
     summary: null,
     recommendations: null,
-    trends: null
+    trends: null,
+    ragMetrics: null
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -46,10 +47,14 @@ const Analytics = ({ userEmail }) => {
         prService.getUserTrends(userEmail),
       ]);
 
+      // Fetch RAG metrics using email directly
+      const ragMetricsResult = await prService.getUserStatistics(userEmail);
+
       setData({
         summary: summaryResult.success ? summaryResult.data : null,
         recommendations: recommendationsResult.success ? recommendationsResult.data : null,
-        trends: trendsResult.success ? trendsResult.data : null
+        trends: trendsResult.success ? trendsResult.data : null,
+        ragMetrics: ragMetricsResult.success ? ragMetricsResult.data : null
       });
 
       // Set loading to false first to show something
@@ -96,12 +101,13 @@ const Analytics = ({ userEmail }) => {
     );
   }
 
-  const { summary, recommendations, trends } = data;
+  const { summary, recommendations, trends, ragMetrics } = data;
   
   // Check if we have any data at all
   const hasData = (summary && Object.keys(summary).length > 0) || 
                   (recommendations && Object.keys(recommendations).length > 0) || 
-                  (trends && Object.keys(trends).length > 0);
+                  (trends && Object.keys(trends).length > 0) ||
+                  (ragMetrics && Object.keys(ragMetrics).length > 0);
   
   return (
     <div className="analytics-container">
@@ -126,6 +132,15 @@ const Analytics = ({ userEmail }) => {
         <div className="analytics-section">
           <h3><span className="section-icon">🎯</span> Performance Summary</h3>
           <p className="section-subtitle">Last {summary.period_days || 30} days</p>
+          
+          {/* Summary Text */}
+          {summary.summary_text && (
+            <div className="summary-text-section">
+              <div className="summary-text-content">
+                {summary.summary_text}
+              </div>
+            </div>
+          )}
           
           <div className="performance-grid">
             <div className="performance-card">
@@ -218,6 +233,130 @@ const Analytics = ({ userEmail }) => {
                     {practice.count && <span className="practice-count">{practice.count}x</span>}
                   </div>
                 ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* RAG Metrics Section */}
+      {ragMetrics && ragMetrics.rag_metrics && (
+        <div className="analytics-section">
+          <h3><span className="section-icon">🤖</span> RAG Intelligence Metrics</h3>
+          <p className="section-subtitle">AI-powered insights and learning analytics</p>
+          
+          <div className="performance-grid">
+            <div className="performance-card">
+              <div className="card-icon rag">🎯</div>
+              <div className="card-label">Average Risk Score</div>
+              <div className={`card-value ${
+                ragMetrics.rag_metrics.avg_risk_score > 0.7 ? 'critical' : 
+                ragMetrics.rag_metrics.avg_risk_score > 0.4 ? 'poor' : 'good'
+              }`}>
+                {ragMetrics.rag_metrics.avg_risk_score 
+                  ? (ragMetrics.rag_metrics.avg_risk_score * 100).toFixed(0) + '%'
+                  : 'N/A'}
+              </div>
+            </div>
+
+            <div className="performance-card">
+              <div className="card-icon rag">✨</div>
+              <div className="card-label">Average Novelty Score</div>
+              <div className={`card-value ${
+                ragMetrics.rag_metrics.avg_novelty_score > 0.8 ? 'excellent' : 
+                ragMetrics.rag_metrics.avg_novelty_score > 0.5 ? 'good' : 'fair'
+              }`}>
+                {ragMetrics.rag_metrics.avg_novelty_score 
+                  ? (ragMetrics.rag_metrics.avg_novelty_score * 100).toFixed(0) + '%'
+                  : 'N/A'}
+              </div>
+            </div>
+
+            <div className="performance-card">
+              <div className="card-icon rag">🔍</div>
+              <div className="card-label">Total RAG Insights</div>
+              <div className="card-value">{ragMetrics.rag_metrics.total_insights || 0}</div>
+            </div>
+
+            <div className="performance-card">
+              <div className="card-icon rag">💡</div>
+              <div className="card-label">RAG Recommendations</div>
+              <div className="card-value">{ragMetrics.rag_metrics.total_recommendations || 0}</div>
+            </div>
+
+            <div className="performance-card">
+              <div className="card-icon rag">🔗</div>
+              <div className="card-label">Similar PRs Referenced</div>
+              <div className="card-value">{ragMetrics.rag_metrics.total_similar_prs_referenced || 0}</div>
+            </div>
+
+            <div className="performance-card">
+              <div className="card-icon rag">📊</div>
+              <div className="card-label">Patterns Identified</div>
+              <div className="card-value">{ragMetrics.rag_metrics.total_patterns_identified || 0}</div>
+            </div>
+
+            <div className="performance-card">
+              <div className="card-icon rag">⚠️</div>
+              <div className="card-label">High Risk PRs</div>
+              <div className="card-value critical">{ragMetrics.rag_metrics.high_risk_prs_count || 0}</div>
+            </div>
+
+            <div className="performance-card">
+              <div className="card-icon rag">🌟</div>
+              <div className="card-label">Novel Contributions</div>
+              <div className="card-value excellent">{ragMetrics.rag_metrics.novel_prs_count || 0}</div>
+            </div>
+
+            <div className="performance-card">
+              <div className="card-icon rag">📈</div>
+              <div className="card-label">Learning Velocity</div>
+              <div className="card-value">
+                {ragMetrics.rag_metrics.learning_velocity 
+                  ? ragMetrics.rag_metrics.learning_velocity.toFixed(2)
+                  : 'N/A'}
+              </div>
+            </div>
+          </div>
+
+          {/* Most Common Patterns */}
+          {ragMetrics.rag_metrics.most_common_patterns && ragMetrics.rag_metrics.most_common_patterns.length > 0 && (
+            <div className="practices-section">
+              <h4>🔍 Most Common Patterns</h4>
+              <div className="practices-list">
+                {ragMetrics.rag_metrics.most_common_patterns.map((pattern, index) => (
+                  <div key={index} className="practice-item pattern">
+                    <span className="practice-icon">🔍</span>
+                    <span className="practice-text">{pattern}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* RAG Trends */}
+          {ragMetrics.trends && (ragMetrics.trends.rag_risk || ragMetrics.trends.rag_novelty) && (
+            <div className="trends-section">
+              <h4>📊 RAG Trends</h4>
+              <div className="trend-items">
+                {ragMetrics.trends.rag_risk && (
+                  <div className="trend-item">
+                    <span className="trend-label">Risk Trend:</span>
+                    <span className="trend-value">
+                      {getTrendIcon(ragMetrics.trends.rag_risk)}
+                      {ragMetrics.trends.rag_risk}
+                    </span>
+                  </div>
+                )}
+                {ragMetrics.trends.rag_novelty && (
+                  <div className="trend-item">
+                    <span className="trend-label">Novelty Trend:</span>
+                    <span className="trend-value">
+                      {getTrendIcon(ragMetrics.trends.rag_novelty)}
+                      {ragMetrics.trends.rag_novelty}
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
           )}

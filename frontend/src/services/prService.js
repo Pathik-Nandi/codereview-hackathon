@@ -160,6 +160,36 @@ class PRService {
       return { success: false, error: error.message };
     }
   }
+
+  /**
+   * Get user statistics (includes RAG metrics)
+   */
+  async getUserStatistics(authorLogin) {
+    try {
+      const token = this.getToken();
+      const url = `${API_BASE_URL}/dashboard/user/${authorLogin}/statistics`;
+      
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to fetch user statistics');
+      }
+
+      return { success: true, data };
+    } catch (error) {
+      console.error('getUserStatistics error:', error);
+      return { success: false, error: error.message };
+    }
+  }
 }
 
 export default new PRService();
+

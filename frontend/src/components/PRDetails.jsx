@@ -88,6 +88,14 @@ const PRDetails = ({ pr, onClose }) => {
           >
             Analysis
           </button>
+          {prData.rag_insights && (
+            <button
+              className={`tab ${activeTab === 'rag' ? 'active' : ''}`}
+              onClick={() => setActiveTab('rag')}
+            >
+              🤖 RAG Insights
+            </button>
+          )}
         </div>
 
         <div className="pr-details-body">
@@ -359,6 +367,145 @@ const PRDetails = ({ pr, onClose }) => {
                         <span className="info-label">Coverage:</span>
                         <span className="info-value">{prData.issues_by_agent.coverage}</span>
                       </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'rag' && prData.rag_insights && (
+            <div className="tab-content">
+              <div className="rag-insights-container">
+                {/* RAG Scores */}
+                <div className="rag-scores-section">
+                  <div className="score-cards">
+                    <div className="score-card rag-card">
+                      <h3>🎯 Risk Score</h3>
+                      <div className={`score-value large ${prData.rag_insights.risk_score > 0.7 ? 'high-risk' : prData.rag_insights.risk_score > 0.4 ? 'medium-risk' : 'low-risk'}`}>
+                        {(prData.rag_insights.risk_score * 100).toFixed(0)}%
+                      </div>
+                      <p className="score-description">
+                        {prData.rag_insights.risk_score > 0.7 ? 'High risk detected' : 
+                         prData.rag_insights.risk_score > 0.4 ? 'Moderate risk' : 'Low risk'}
+                      </p>
+                    </div>
+                    <div className="score-card rag-card">
+                      <h3>✨ Novelty Score</h3>
+                      <div className={`score-value large ${prData.rag_insights.novelty_score > 0.8 ? 'high-novelty' : prData.rag_insights.novelty_score > 0.5 ? 'medium-novelty' : 'low-novelty'}`}>
+                        {(prData.rag_insights.novelty_score * 100).toFixed(0)}%
+                      </div>
+                      <p className="score-description">
+                        {prData.rag_insights.novelty_score > 0.8 ? 'Highly innovative' : 
+                         prData.rag_insights.novelty_score > 0.5 ? 'Moderately novel' : 'Common pattern'}
+                      </p>
+                    </div>
+                    <div className="score-card rag-card">
+                      <h3>🔍 Complexity</h3>
+                      <div className="score-value large">{prData.rag_insights.complexity_assessment || 'N/A'}</div>
+                      <p className="score-description">Assessed complexity level</p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* RAG Analysis - Full Text */}
+                {prData.rag_insights.full_text && (
+                  <div className="rag-section">
+                    <h3>🤖 RAG Analysis</h3>
+                    <div className="rag-text-content" style={{ whiteSpace: 'pre-wrap', lineHeight: '1.6' }}>
+                      {prData.rag_insights.full_text}
+                    </div>
+                  </div>
+                )}
+
+                {/* Summary (fallback if no full_text) */}
+                {!prData.rag_insights.full_text && prData.rag_insights.summary && (
+                  <div className="rag-section">
+                    <h3>📝 Summary</h3>
+                    <p className="rag-text">{prData.rag_insights.summary}</p>
+                  </div>
+                )}
+
+                {/* Similar PRs */}
+                {prData.rag_insights.similar_prs && prData.rag_insights.similar_prs.length > 0 && (
+                  <div className="rag-section">
+                    <h3>🔗 Similar PRs ({prData.rag_insights.similar_prs_found})</h3>
+                    <div className="similar-prs-list">
+                      {prData.rag_insights.similar_prs.map((similarPR, index) => (
+                        <div key={index} className="similar-pr-card">
+                          <div className="similar-pr-header">
+                            <span className="similar-pr-number">#{similarPR.pr_number || 'N/A'}</span>
+                            <span className="similarity-score">{(similarPR.similarity_score * 100).toFixed(0)}% similar</span>
+                          </div>
+                          {similarPR.similarity_type && (
+                            <div className="similarity-type">Type: {similarPR.similarity_type}</div>
+                          )}
+                          {similarPR.lesson_extracted && (
+                            <div className="lesson-learned">
+                              <strong>💡 Lesson:</strong> {similarPR.lesson_extracted}
+                            </div>
+                          )}
+                          {similarPR.pattern_identified && (
+                            <div className="pattern-identified">
+                              <strong>🔍 Pattern:</strong> {similarPR.pattern_identified}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Recommendations */}
+                {prData.rag_insights.detailed_recommendations && prData.rag_insights.detailed_recommendations.length > 0 && (
+                  <div className="rag-section">
+                    <h3>💡 RAG Recommendations ({prData.rag_insights.detailed_recommendations.length})</h3>
+                    <div className="recommendations-list">
+                      {prData.rag_insights.detailed_recommendations.map((rec, index) => (
+                        <div key={index} className={`recommendation-card priority-${rec.priority}`}>
+                          <div className="recommendation-header">
+                            <span className={`priority-badge ${rec.priority}`}>{rec.priority}</span>
+                            <span className="recommendation-type">{rec.type}</span>
+                          </div>
+                          <h4 className="recommendation-title">{rec.title}</h4>
+                          <p className="recommendation-description">{rec.description}</p>
+                          {rec.reasoning && (
+                            <div className="recommendation-reasoning">
+                              <strong>Why:</strong> {rec.reasoning}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Lessons Learned - only show if no full_text */}
+                {!prData.rag_insights.full_text && prData.rag_insights.lessons_learned && (
+                  <div className="rag-section">
+                    <h3>📚 Lessons Learned</h3>
+                    <div className="rag-text-content">
+                      {prData.rag_insights.lessons_learned}
+                    </div>
+                  </div>
+                )}
+
+                {/* Potential Pitfalls - only show if no full_text */}
+                {!prData.rag_insights.full_text && prData.rag_insights.potential_pitfalls && (
+                  <div className="rag-section">
+                    <h3>⚠️ Potential Pitfalls</h3>
+                    <div className="rag-text-content">
+                      {prData.rag_insights.potential_pitfalls}
+                    </div>
+                  </div>
+                )}
+
+                {/* Best Practices - only show if no full_text */}
+                {!prData.rag_insights.full_text && prData.rag_insights.best_practices_suggested && (
+                  <div className="rag-section">
+                    <h3>✅ Best Practices Suggested</h3>
+                    <div className="rag-text-content">
+                      {prData.rag_insights.best_practices_suggested}
                     </div>
                   </div>
                 )}

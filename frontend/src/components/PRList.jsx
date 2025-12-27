@@ -61,6 +61,20 @@ const PRList = ({ onPRClick = () => {} }) => {
     return '#f44336';
   };
 
+  const getRiskColor = (score) => {
+    if (!score) return '#9e9e9e';
+    if (score >= 0.7) return '#f44336'; // High risk - red
+    if (score >= 0.4) return '#ff9800'; // Medium risk - orange
+    return '#4caf50'; // Low risk - green
+  };
+
+  const getNoveltyColor = (score) => {
+    if (!score) return '#9e9e9e';
+    if (score >= 0.8) return '#9c27b0'; // High novelty - purple
+    if (score >= 0.5) return '#2196f3'; // Medium novelty - blue
+    return '#9e9e9e'; // Low novelty - gray
+  };
+
   if (loading) {
     return (
       <div className="pr-list-loading">
@@ -137,6 +151,18 @@ const PRList = ({ onPRClick = () => {} }) => {
             </span>
             <span className="stat-label">No Critical Issues</span>
           </div>
+          <div className="stat-card">
+            <span className="stat-value">
+              {prs.filter((pr) => pr.has_rag_insights).length}
+            </span>
+            <span className="stat-label">With RAG Insights</span>
+          </div>
+          <div className="stat-card">
+            <span className="stat-value">
+              {prs.filter((pr) => pr.rag_novelty_score > 0.8).length}
+            </span>
+            <span className="stat-label">Novel PRs</span>
+          </div>
         </div>
       )}
 
@@ -194,6 +220,44 @@ const PRList = ({ onPRClick = () => {} }) => {
                   </span>
                 </div>
               </div>
+
+              {/* RAG Metrics Section */}
+              {pr.has_rag_insights && (
+                <div className="pr-rag-metrics">
+                  <div className="rag-badge-container">
+                    {pr.rag_risk_score !== null && (
+                      <div
+                        className="rag-badge risk"
+                        style={{ backgroundColor: getRiskColor(pr.rag_risk_score) }}
+                      >
+                        <span className="rag-label">Risk</span>
+                        <span className="rag-value">{(pr.rag_risk_score * 100).toFixed(0)}%</span>
+                      </div>
+                    )}
+                    {pr.rag_novelty_score !== null && (
+                      <div
+                        className="rag-badge novelty"
+                        style={{ backgroundColor: getNoveltyColor(pr.rag_novelty_score) }}
+                      >
+                        <span className="rag-label">Novelty</span>
+                        <span className="rag-value">{(pr.rag_novelty_score * 100).toFixed(0)}%</span>
+                      </div>
+                    )}
+                    {pr.rag_similar_prs_count > 0 && (
+                      <div className="rag-badge similar">
+                        <span className="rag-icon">🔗</span>
+                        <span className="rag-value">{pr.rag_similar_prs_count} similar</span>
+                      </div>
+                    )}
+                    {pr.rag_recommendations_count > 0 && (
+                      <div className="rag-badge recommendations">
+                        <span className="rag-icon">💡</span>
+                        <span className="rag-value">{pr.rag_recommendations_count} tips</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
 
               <div className="pr-stats">
                 <span className="pr-stat">

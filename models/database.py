@@ -67,6 +67,15 @@ class PRAnalysis(Base):
     security_score = Column(Float)
     maintainability_score = Column(Float)
     
+    # RAG Enhanced Analysis
+    has_rag_insights = Column(Boolean, default=False)  # Whether RAG analysis was performed
+    rag_risk_score = Column(Float)  # Risk score from RAG analysis (0-1)
+    rag_novelty_score = Column(Float)  # Novelty score from RAG analysis (0-1)
+    rag_similar_prs_count = Column(Integer, default=0)  # Number of similar PRs found
+    rag_recommendations_count = Column(Integer, default=0)  # Number of recommendations
+    rag_patterns_identified = Column(JSON)  # List of patterns identified
+    rag_insights = Column(JSON)  # Stores complete RAG Enhanced Agent insights
+    
     # Analysis Metadata
     analysis_duration_ms = Column(Integer)
     analyzed_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -213,10 +222,24 @@ class UserStatistics(Base):
     avg_coverage = Column(Float)
     avg_complexity = Column(Float)
     
+    # RAG Metrics (Aggregated from RAG insights)
+    total_rag_insights = Column(Integer, default=0)  # PRs with RAG insights
+    avg_rag_risk_score = Column(Float)  # Average risk score across PRs
+    avg_rag_novelty_score = Column(Float)  # Average novelty score
+    total_similar_prs_referenced = Column(Integer, default=0)  # Total similar PRs found
+    total_rag_recommendations = Column(Integer, default=0)  # Total recommendations given
+    total_patterns_identified = Column(Integer, default=0)  # Unique patterns identified
+    high_risk_prs_count = Column(Integer, default=0)  # PRs with risk_score > 0.7
+    novel_prs_count = Column(Integer, default=0)  # PRs with novelty_score > 0.8
+    most_common_patterns = Column(JSON)  # Top 5 patterns for this user
+    learning_velocity = Column(Float)  # How often new patterns emerge (patterns/PR)
+    
     # Trend Indicators
     quality_trend = Column(String(20))  # improving, declining, stable
     security_trend = Column(String(20))
     coverage_trend = Column(String(20))
+    rag_risk_trend = Column(String(20))  # RAG risk trend
+    rag_novelty_trend = Column(String(20))  # Novelty trend
     
     # Best/Worst Metrics
     best_pr_id = Column(Integer)  # PR with highest quality score
@@ -312,6 +335,19 @@ class UserAnalytics(Base):
     quality_trend = Column(JSON)  # {direction: 'improving', change: 5.2, recent_avg: 85, older_avg: 79.8}
     security_trend = Column(JSON)
     coverage_trend = Column(JSON)
+    
+    # RAG Trends and Metrics
+    rag_risk_trend = Column(JSON)  # {direction: 'improving', change: -0.15, recent_avg: 0.35, older_avg: 0.50}
+    rag_novelty_trend = Column(JSON)  # Trend in novelty scores
+    avg_rag_risk_score = Column(Float)  # Average RAG risk score in this period
+    avg_rag_novelty_score = Column(Float)  # Average novelty score in this period
+    total_rag_insights = Column(Integer, default=0)  # PRs with RAG insights in period
+    total_similar_prs_found = Column(Integer, default=0)  # Total similar PRs referenced
+    total_rag_recommendations = Column(Integer, default=0)  # Total RAG recommendations given
+    high_risk_prs = Column(JSON)  # Array of high-risk PR numbers with details
+    novel_contributions = Column(JSON)  # Array of novel PRs with details
+    patterns_learned = Column(JSON)  # Patterns identified in this period
+    rag_insights_summary = Column(JSON)  # {lessons_learned: [], pitfalls_avoided: [], best_practices: []}
     
     # Best/Bad Practices (JSON arrays)
     best_practices = Column(JSON)  # Array of best practice objects

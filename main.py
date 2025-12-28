@@ -1490,7 +1490,8 @@ def _fetch_rag_table_data(session, pr_id):
             SELECT id, risk_score, novelty_score, complexity_assessment, 
                    summary, recommendations, lessons_learned, 
                    potential_pitfalls, best_practices_suggested,
-                   context_used, similar_prs_found, similar_prs_referenced
+                   context_used, similar_prs_found, similar_prs_referenced,
+                   full_text
             FROM rag_insights 
             WHERE pr_analysis_id = :pr_id
         """),
@@ -1533,7 +1534,7 @@ def _build_rag_insights_data(session, pr, rag_result, similar_prs_result, recomm
         'risk_score': rag_result[1] or pr.rag_risk_score,
         'novelty_score': rag_result[2] or pr.rag_novelty_score,
         'complexity_assessment': rag_result[3],
-        'full_text': rag_json.get('full_text', ''),
+        'full_text': rag_result[12] or rag_json.get('full_text', ''),
         'summary': rag_result[4] or rag_json.get('summary', ''),
         'recommendations': rag_result[5] or rag_json.get('recommendations', ''),
         'lessons_learned': rag_result[6] or rag_json.get('lessons_learned', ''),

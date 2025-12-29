@@ -194,17 +194,25 @@ frontend/
 
 #### Supporting Agents
 1. **Database Persistence Agent** (`database_persistence_agent.py`)
-   - Stores analysis results
+   - Called from main.py after Main Agent completes
+   - Converts AgentResult to database format
+   - Stores PR analysis in PostgreSQL
+   - Saves RAG insights to separate tables
+   - Updates user statistics
    - Manages PR data lifecycle
 
 2. **Analytics Processing Agent** (`analytics_processing_agent.py`)
-   - User performance analysis
-   - Trend calculation
-   - Aggregated metrics
+   - Invoked via `/api/analytics/*` endpoints
+   - User performance analysis over time
+   - Trend calculation (improving/declining)
+   - Aggregated metrics computation
+   - Historical comparison
+   - Best practices identification
 
 3. **Auto-Merge Agent** (`auto_merge_agent.py`)
    - Automated PR merging (optional)
-   - Conditional merge logic
+   - Conditional merge logic based on quality scores
+   - Configurable thresholds
 
 ### 3. Service Layer (`/services/`)
 
@@ -271,54 +279,62 @@ frontend/
 GitHub PR Event
     │
     ▼
-Webhook/Manual Trigger
+Webhook/Manual Trigger (main.py)
     │
     ▼
-Main Agent Dispatcher
+Agent Dispatcher
     │
-    ├─────────────────────────────────────┐
-    ▼                                     ▼
-Static Analysis                     RAG Enhanced Agent
-    │                                     │
-    │                                     ├─ Query Vector DB
-    │                                     ├─ Find Similar PRs
-    │                                     ├─ Calculate Novelty
-    │                                     └─ Generate Recommendations
-    ▼                                     ▼
-Security Analysis                   Pattern Identification
-    │                                     │
-    ▼                                     ▼
-Code Quality Check                  Risk Assessment
-    │                                     │
-    ▼                                     │
-Context Analysis                        │
-    │                                     │
-    ▼                                     │
-Coverage Metrics                        │
-    │                                     │
-    └─────────────────┬───────────────────┘
+    ▼
+Main Orchestrator Agent
+    │
+    ├──────────────────────────────────────────────────────┐
+    │                                                       │
+    ├─► Static Analysis Agent                              │
+    │   └─ Code structure, complexity, style               │
+    │                                                       │
+    ├─► Security Agent                                     │
+    │   └─ Vulnerabilities, best practices                 │
+    │                                                       │
+    ├─► Code Quality Agent                                 │
+    │   └─ Code smells, maintainability                    │
+    │                                                       │
+    ├─► Context Agent                                      │
+    │   └─ PR context, file relationships                  │
+    │                                                       │
+    ├─► Coverage & Metrics Agent                           │
+    │   └─ Test coverage, quality scores                   │
+    │                                                       │
+    └─► RAG Enhanced Agent (if enabled)                    │
+        ├─ Query ChromaDB Vector DB                        │
+        ├─ Find Similar PRs (Top K)                        │
+        ├─ Calculate Novelty & Risk Scores                 │
+        ├─ Generate AI Insights (OpenAI/Gemini)            │
+        └─ Store Embeddings in ChromaDB                    │
+                                                            │
+                      ▼                                     │
+            Aggregate All Results                           │
+            (Main Agent combines all agent outputs)         │
+                      │                                     │
+                      └─────────────────────────────────────┘
                       ▼
-            Aggregate Results
-                      │
-                      ▼
-        Database Persistence Agent
-                      │
-                      ├─ Store in PostgreSQL
-                      └─ Store Embeddings in ChromaDB
-                      │
-                      ▼
-            Analytics Processing
-                      │
-                      ├─ Update User Stats
-                      ├─ Calculate Trends
-                      └─ Generate Insights
+            Return to Dispatcher
                       │
                       ▼
-            Return Results to API
+            Return to API Endpoint (main.py)
+                      │
+                      ├─► Database Persistence Agent
+                      │   ├─ Convert results to DB format
+                      │   ├─ Store PR analysis in PostgreSQL
+                      │   └─ Update user statistics
+                      │
+                      ▼
+            Return JSON Response to Frontend
                       │
                       ▼
             Frontend Display
 ```
+
+**Note**: Analytics Processing Agent is invoked separately via `/api/analytics/*` endpoints for on-demand trend analysis and user insights generation.
 
 ### 2. User Analytics Flow
 
@@ -328,63 +344,99 @@ User Request (Frontend)
     ▼
 API Endpoint (/api/analytics/user/*)
     │
+    ├─► /api/analytics/user/summary
+    ├─► /api/analytics/user/trends  
+    ├─► /api/analytics/user/recommendations
+    └─► /api/analytics/user/over-time
+    │
     ▼
 Analytics Processing Agent
     │
     ├─ Query Database for User PRs
-    ├─ Calculate Metrics
-    ├─ Analyze Trends
+    ├─ Calculate Aggregate Metrics
+    ├─ Analyze Historical Trends
     ├─ Identify Patterns
-    └─ Generate Summary
+    ├─ Compare Time Periods
+    └─ Generate Insights & Recommendations
     │
     ▼
 Return JSON Response
     │
+    ├─ Current Statistics
+    ├─ Trend Analysis (improving/declining)
+    ├─ Best Practices Identified
+    └─ Areas for Improvement
+    │
     ▼
 Frontend Visualization
+    (Charts, Graphs, Trend Indicators)
 ```
 
 ### 3. RAG System Flow
 
 ```
-New PR
+New PR Analysis Request
     │
     ▼
-Extract PR Content
+RAG Enhanced Agent (within Main Agent)
     │
-    ├─ Code Changes
-    ├─ Commit Messages
-    ├─ File Paths
-    └─ Metadata
+    ├─ Extract PR Content
+    │   ├─ Code Changes (diffs)
+    │   ├─ Commit Messages
+    │   ├─ File Paths & Extensions
+    │   └─ PR Metadata (author, title, desc)
     │
     ▼
 Generate Embedding
     │
     └─ Sentence Transformer (all-MiniLM-L6-v2)
+    │   └─ 384-dimensional vector
     │
     ▼
-Query ChromaDB
+Query ChromaDB Vector Database
     │
-    ├─ Find Similar PRs (Top K)
-    ├─ Calculate Similarity Scores
-    └─ Retrieve Context
+    ├─ Find Similar PRs (Top K=5 by default)
+    ├─ Calculate Cosine Similarity Scores
+    ├─ Filter by Metadata (repo, language)
+    └─ Retrieve Similar PR Context
     │
     ▼
-Calculate Metrics
+Calculate RAG Metrics
     │
-    ├─ Novelty Score = 1 - avg_similarity
+    ├─ Novelty Score = 1.0 - avg_similarity
+    │   └─ Range: 0.0 (common) to 1.0 (novel)
+    │
     ├─ Risk Score (based on patterns)
+    │   └─ Factors: complexity, security, novelty
+    │
     └─ Recommendation Count
     │
     ▼
-Generate AI Insights
+Generate AI Insights (OpenAI gpt-4o-mini / Gemini)
     │
-    └─ OpenAI API (gpt-4o-mini)
+    ├─ Analyze patterns from similar PRs
+    ├─ Identify lessons learned
+    ├─ Generate recommendations
+    ├─ Assess potential pitfalls
+    └─ Suggest best practices
     │
     ▼
-Store in Vector DB
+Store Results
     │
-    └─ Add to ChromaDB for future queries
+    ├─ Add PR Embedding to ChromaDB
+    │   └─ For future similarity searches
+    │
+    └─ Return RAG Insights in Agent Metadata
+        └─ Included in Main Agent result
+    │
+    ▼
+Database Persistence Agent (in main.py)
+    │
+    └─ Store RAG Insights in PostgreSQL
+        ├─ rag_insights table (full_text, scores)
+        ├─ rag_learned_patterns
+        ├─ rag_recommendations
+        └─ rag_similar_pr_references
 ```
 
 ---
@@ -586,45 +638,70 @@ CREATE TABLE rag_similar_pr_references (
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    RAG Enhanced Agent                        │
+│              (Runs within Main Orchestrator Agent)           │
 │                                                              │
 │  ┌────────────────────────────────────────────────────┐     │
 │  │  1. Query Processing                               │     │
-│  │     - Extract PR features                          │     │
-│  │     - Generate query embedding                     │     │
+│  │     - Extract PR features (files, changes, metadata) │
+│  │     - Build query text from PR content             │     │
+│  │     - Generate query embedding (384-dim vector)    │     │
 │  └────────────────────────────────────────────────────┘     │
 │                         │                                    │
 │                         ▼                                    │
 │  ┌────────────────────────────────────────────────────┐     │
 │  │  2. Vector Database Query (ChromaDB)               │     │
-│  │     - Similarity search                            │     │
-│  │     - Top K similar PRs                            │     │
-│  │     - Metadata filtering                           │     │
+│  │     - Similarity search (cosine distance)          │     │
+│  │     - Top K similar PRs (default: 5)               │     │
+│  │     - Metadata filtering (repository, language)    │     │
+│  │     - Distance threshold filtering                 │     │
 │  └────────────────────────────────────────────────────┘     │
 │                         │                                    │
 │                         ▼                                    │
 │  ┌────────────────────────────────────────────────────┐     │
 │  │  3. Context Enrichment                             │     │
 │  │     - Aggregate similar PR data                    │     │
-│  │     - Extract patterns                             │     │
-│  │     - Calculate metrics                            │     │
+│  │     - Extract common patterns                      │     │
+│  │     - Calculate novelty score (1 - avg_similarity) │  │
+│  │     - Identify lessons learned from history        │     │
 │  └────────────────────────────────────────────────────┘     │
 │                         │                                    │
 │                         ▼                                    │
 │  ┌────────────────────────────────────────────────────┐     │
-│  │  4. AI Generation (OpenAI/Gemini)                  │     │
-│  │     - Generate insights                            │     │
-│  │     - Create recommendations                       │     │
-│  │     - Risk assessment                              │     │
+│  │  4. AI Generation (OpenAI gpt-4o-mini / Gemini)    │     │
+│  │     - Generate comprehensive insights              │     │
+│  │     - Create actionable recommendations            │     │
+│  │     - Risk assessment based on patterns            │     │
+│  │     - Identify potential pitfalls                  │     │
+│  │     - Suggest best practices                       │     │
 │  └────────────────────────────────────────────────────┘     │
 │                         │                                    │
 │                         ▼                                    │
 │  ┌────────────────────────────────────────────────────┐     │
-│  │  5. Store Results                                  │     │
-│  │     - Update PostgreSQL                            │     │
-│  │     - Add to ChromaDB                              │     │
+│  │  5. Store Embeddings & Return Insights             │     │
+│  │     - Add PR embedding to ChromaDB                 │     │
+│  │     - Return insights in agent metadata            │     │
+│  │     - Include: full_text, risk_score, novelty_score│    │
+│  │     - Include: similar_prs, recommendations        │     │
 │  └────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+        ┌────────────────────────────────────────┐
+        │  Database Persistence Agent (main.py)  │
+        │  - Store RAG insights in PostgreSQL    │
+        │  - rag_insights table                  │
+        │  - rag_learned_patterns table          │
+        │  - rag_recommendations table           │
+        │  - rag_similar_pr_references table     │
+        └────────────────────────────────────────┘
 ```
+
+**Key Points**:
+- RAG Enhanced Agent runs as part of the Main Orchestrator Agent's workflow
+- Embeddings are stored in ChromaDB immediately for future similarity searches
+- RAG insights are returned in agent metadata (not stored by RAG agent itself)
+- Database Persistence Agent (in main.py) handles storing RAG insights to PostgreSQL
+- This separation allows RAG agent to focus on analysis, not persistence
 
 ### Key Metrics
 

@@ -33,7 +33,7 @@ GITHUB_API_HEADERS = {
 }
 
 # Default repository (can be overridden)
-DEFAULT_REPOSITORY = os.getenv('GITHUB_REPOSITORY', 'KB-iGOT/cb-ext-course-service')
+DEFAULT_REPOSITORY = os.getenv('GITHUB_REPOSITORY', 'tarentomaheshvakkund/testdata-hackathon')
 
 # Rate limiting
 GITHUB_API_DELAY = float(os.getenv('GITHUB_API_DELAY', '0.5'))  # seconds between requests

@@ -267,6 +267,87 @@ CREATE TABLE IF NOT EXISTS rag_similar_pr_references (
 );
 
 -- ----------------------------------------------------------------------------
+-- PR Comments Table
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pr_comments (
+    id SERIAL PRIMARY KEY,
+    pr_analysis_id INTEGER NOT NULL,
+    pr_issue_id INTEGER,
+    comment_type VARCHAR(50) NOT NULL,
+    github_comment_id BIGINT,
+    github_review_id BIGINT,
+    file_path VARCHAR(1000),
+    line_number INTEGER,
+    commit_sha VARCHAR(40),
+    comment_body TEXT NOT NULL,
+    severity VARCHAR(20),
+    issue_type VARCHAR(100),
+    posted_successfully BOOLEAN DEFAULT FALSE,
+    error_message TEXT,
+    reactions_count INTEGER DEFAULT 0,
+    reply_count INTEGER DEFAULT 0,
+    is_resolved BOOLEAN DEFAULT FALSE,
+    resolved_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    
+    CONSTRAINT fk_pr_comments_analysis FOREIGN KEY (pr_analysis_id) 
+        REFERENCES pr_analysis (id) 
+        ON DELETE CASCADE,
+    CONSTRAINT fk_pr_comments_issue FOREIGN KEY (pr_issue_id) 
+        REFERENCES pr_issues (id) 
+        ON DELETE SET NULL,
+    CONSTRAINT valid_comment_type CHECK (
+        comment_type IN ('summary', 'inline', 'review', 'followup')
+    ),
+    CONSTRAINT valid_severity CHECK (
+        severity IN ('critical', 'high', 'medium', 'low', 'info', NULL)
+    )
+);
+
+-- ----------------------------------------------------------------------------
+-- PR Comment Statistics Table
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pr_comment_statistics (
+    id SERIAL PRIMARY KEY,
+    pr_analysis_id INTEGER NOT NULL,
+    total_comments INTEGER DEFAULT 0,
+    summary_comments INTEGER DEFAULT 0,
+    inline_comments INTEGER DEFAULT 0,
+    review_comments INTEGER DEFAULT 0,
+    critical_comments INTEGER DEFAULT 0,
+    high_comments INTEGER DEFAULT 0,
+    medium_comments INTEGER DEFAULT 0,
+    low_comments INTEGER DEFAULT 0,
+    info_comments INTEGER DEFAULT 0,
+    posted_successfully INTEGER DEFAULT 0,
+    failed_to_post INTEGER DEFAULT 0,
+    total_reactions INTEGER DEFAULT 0,
+    total_replies INTEGER DEFAULT 0,
+    resolved_comments INTEGER DEFAULT 0,
+    avg_reactions_per_comment FLOAT DEFAULT 0.0,
+    avg_replies_per_comment FLOAT DEFAULT 0.0,
+    engagement_rate FLOAT DEFAULT 0.0,
+    resolution_rate FLOAT DEFAULT 0.0,
+    success_rate FLOAT DEFAULT 0.0,
+    files_commented INTEGER DEFAULT 0,
+    avg_comments_per_file FLOAT DEFAULT 0.0,
+    first_comment_at TIMESTAMP WITH TIME ZONE,
+    last_comment_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    
+    CONSTRAINT fk_pr_comment_stats_analysis FOREIGN KEY (pr_analysis_id) 
+        REFERENCES pr_analysis (id) 
+        ON DELETE CASCADE,
+    CONSTRAINT valid_rates CHECK (
+        (engagement_rate >= 0 AND engagement_rate <= 1) AND
+        (resolution_rate >= 0 AND resolution_rate <= 1) AND
+        (success_rate >= 0 AND success_rate <= 1)
+    )
+);
+
+-- ----------------------------------------------------------------------------
 -- Best Practices Table
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS best_practices (
@@ -446,6 +527,22 @@ CREATE INDEX IF NOT EXISTS idx_feedback_user_email ON feedback(user_email);
 -- Analysis History
 CREATE INDEX IF NOT EXISTS idx_analysis_history_pr ON analysis_history(pr_number, repository);
 CREATE INDEX IF NOT EXISTS idx_analysis_history_analyzed_at ON analysis_history(analyzed_at DESC);
+
+-- PR Comments
+CREATE INDEX IF NOT EXISTS idx_pr_comments_pr_analysis ON pr_comments(pr_analysis_id);
+CREATE INDEX IF NOT EXISTS idx_pr_comments_pr_issue ON pr_comments(pr_issue_id);
+CREATE INDEX IF NOT EXISTS idx_pr_comments_github_comment ON pr_comments(github_comment_id);
+CREATE INDEX IF NOT EXISTS idx_pr_comments_github_review ON pr_comments(github_review_id);
+CREATE INDEX IF NOT EXISTS idx_pr_comments_type ON pr_comments(comment_type);
+CREATE INDEX IF NOT EXISTS idx_pr_comments_severity ON pr_comments(severity);
+CREATE INDEX IF NOT EXISTS idx_pr_comments_file_path ON pr_comments(file_path);
+CREATE INDEX IF NOT EXISTS idx_pr_comments_posted ON pr_comments(posted_successfully);
+CREATE INDEX IF NOT EXISTS idx_pr_comments_resolved ON pr_comments(is_resolved);
+CREATE INDEX IF NOT EXISTS idx_pr_comments_created_at ON pr_comments(created_at DESC);
+
+-- PR Comment Statistics
+CREATE INDEX IF NOT EXISTS idx_pr_comment_stats_pr_analysis ON pr_comment_statistics(pr_analysis_id);
+CREATE INDEX IF NOT EXISTS idx_pr_comment_stats_created_at ON pr_comment_statistics(created_at DESC);
 
 -- ============================================================================
 -- END OF SCRIPT

@@ -13,6 +13,7 @@ Base = declarative_base()
 
 # Constants
 CASCADE_ALL_DELETE_ORPHAN = "all, delete-orphan"
+PR_ANALYSIS_ID_FK = 'pr_analysis.id'
 
 
 class PRAnalysis(Base):
@@ -88,6 +89,7 @@ class PRAnalysis(Base):
     # Relationships
     issues = relationship("PRIssue", back_populates="analysis", cascade=CASCADE_ALL_DELETE_ORPHAN)
     metrics = relationship("PRMetrics", back_populates="analysis", uselist=False, cascade=CASCADE_ALL_DELETE_ORPHAN)
+    comments = relationship("PRComment", back_populates="analysis", cascade=CASCADE_ALL_DELETE_ORPHAN)
     
     # Composite indexes and constraints for common queries
     __table_args__ = (
@@ -108,7 +110,7 @@ class PRIssue(Base):
     __tablename__ = 'pr_issues'
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    pr_analysis_id = Column(Integer, ForeignKey('pr_analysis.id'), nullable=False, index=True)
+    pr_analysis_id = Column(Integer, ForeignKey(PR_ANALYSIS_ID_FK), nullable=False, index=True)
     
     # Issue Classification
     agent_name = Column(String(100), nullable=False, index=True)
@@ -137,6 +139,7 @@ class PRIssue(Base):
     
     # Relationships
     analysis = relationship("PRAnalysis", back_populates="issues")
+    comments = relationship("PRComment", back_populates="issue")
     
     def __repr__(self):
         return f"<PRIssue(id={self.id}, type={self.issue_type}, severity={self.severity})>"
@@ -147,7 +150,7 @@ class PRMetrics(Base):
     __tablename__ = 'pr_metrics'
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    pr_analysis_id = Column(Integer, ForeignKey('pr_analysis.id'), nullable=False, unique=True)
+    pr_analysis_id = Column(Integer, ForeignKey(PR_ANALYSIS_ID_FK), nullable=False, unique=True)
     
     # Coverage Metrics
     code_files_changed = Column(Integer, default=0)
@@ -437,3 +440,136 @@ class UserSession(Base):
     
     def __repr__(self):
         return f"<UserSession(id={self.id}, user_id={self.user_id}, is_active={self.is_active})>"
+
+
+class PRComment(Base):
+    """Table to track comments posted by the PR Comment Agent to GitHub."""
+    __tablename__ = 'pr_comments'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    pr_analysis_id = Column(Integer, ForeignKey(PR_ANALYSIS_ID_FK), nullable=False, index=True)
+    
+    # Comment Identification
+    github_comment_id = Column(String(100), index=True)  # GitHub's comment ID (for updates/deletes)
+    github_review_id = Column(String(100), index=True)  # GitHub's review ID (for review comments)
+    comment_type = Column(String(20), nullable=False, index=True)  # 'summary', 'inline', 'review'
+    
+    # Comment Location (for inline comments)
+    file_path = Column(String(500))  # File where inline comment was posted
+    line_number = Column(Integer)  # Line number for inline comment
+    commit_sha = Column(String(40))  # Commit SHA the comment was posted on
+    
+    # Comment Content
+    comment_body = Column(Text, nullable=False)  # Full text of the comment
+    comment_preview = Column(String(200))  # First 200 chars for quick display
+    
+    # Issue Reference (for inline comments linked to specific issues)
+    pr_issue_id = Column(Integer, ForeignKey('pr_issues.id'), index=True)  # Link to specific issue
+    issue_severity = Column(String(20))  # critical, high, medium, low
+    issue_type = Column(String(100))  # security, quality, complexity, etc.
+    
+    # Status Tracking
+    posted_successfully = Column(Boolean, default=True, index=True)
+    post_error = Column(Text)  # Error message if posting failed
+    review_event = Column(String(20))  # COMMENT, REQUEST_CHANGES, APPROVE
+    
+    # GitHub Response
+    github_url = Column(String(500))  # Direct URL to the comment on GitHub
+    github_response = Column(JSON)  # Full response from GitHub API
+    
+    # User Interaction Tracking
+    reactions_count = Column(Integer, default=0)  # Number of reactions (👍, ❤️, etc.)
+    replies_count = Column(Integer, default=0)  # Number of replies to this comment
+    was_edited = Column(Boolean, default=False)  # Whether developer edited/resolved the comment
+    was_resolved = Column(Boolean, default=False)  # Whether the issue was marked as resolved
+    resolved_at = Column(DateTime)
+    
+    # Metadata
+    agent_version = Column(String(50))  # Version of PR Comment Agent
+    config_used = Column(JSON)  # Configuration snapshot (severity threshold, etc.)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    posted_at = Column(DateTime, default=datetime.utcnow)
+    last_checked_at = Column(DateTime)  # Last time we checked for reactions/replies
+    
+    # Relationships
+    analysis = relationship("PRAnalysis", back_populates="comments")
+    issue = relationship("PRIssue", back_populates="comments")
+    
+    # Indexes for efficient queries
+    __table_args__ = (
+        Index('idx_pr_comment_analysis', 'pr_analysis_id', 'comment_type'),
+        Index('idx_pr_comment_file', 'pr_analysis_id', 'file_path'),
+        Index('idx_pr_comment_severity', 'issue_severity', 'posted_successfully'),
+        Index('idx_pr_comment_date', 'posted_at', 'comment_type'),
+        Index('idx_pr_comment_github_id', 'github_comment_id', 'github_review_id'),
+    )
+    
+    def __repr__(self):
+        return f"<PRComment(id={self.id}, type={self.comment_type}, file={self.file_path}, line={self.line_number})>"
+
+
+class PRCommentStatistics(Base):
+    """Aggregated statistics about PR comments for analytics."""
+    __tablename__ = 'pr_comment_statistics'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # Time Period
+    date = Column(DateTime, nullable=False, index=True)  # Date this snapshot was taken
+    period_type = Column(String(20))  # 'daily', 'weekly', 'monthly'
+    
+    # Volume Metrics
+    total_comments_posted = Column(Integer, default=0)
+    summary_comments = Column(Integer, default=0)
+    inline_comments = Column(Integer, default=0)
+    review_comments = Column(Integer, default=0)
+    
+    # Success Metrics
+    successful_posts = Column(Integer, default=0)
+    failed_posts = Column(Integer, default=0)
+    success_rate = Column(Float)  # Percentage
+    
+    # Comment Distribution by Severity
+    critical_comments = Column(Integer, default=0)
+    high_comments = Column(Integer, default=0)
+    medium_comments = Column(Integer, default=0)
+    low_comments = Column(Integer, default=0)
+    
+    # Comment Distribution by Type
+    security_comments = Column(Integer, default=0)
+    quality_comments = Column(Integer, default=0)
+    complexity_comments = Column(Integer, default=0)
+    coverage_comments = Column(Integer, default=0)
+    
+    # Engagement Metrics
+    avg_reactions_per_comment = Column(Float)
+    avg_replies_per_comment = Column(Float)
+    total_reactions = Column(Integer, default=0)
+    total_replies = Column(Integer, default=0)
+    
+    # Resolution Metrics
+    comments_resolved = Column(Integer, default=0)
+    comments_edited = Column(Integer, default=0)
+    resolution_rate = Column(Float)  # Percentage
+    avg_resolution_time_hours = Column(Float)
+    
+    # Review Type Distribution
+    request_changes_count = Column(Integer, default=0)
+    comment_only_count = Column(Integer, default=0)
+    approve_count = Column(Integer, default=0)
+    
+    # Performance Metrics
+    avg_post_time_ms = Column(Integer)  # Average time to post a comment
+    
+    # Metadata
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_comment_stats_date', 'date', 'period_type'),
+    )
+    
+    def __repr__(self):
+        return f"<PRCommentStatistics(date={self.date}, period={self.period_type}, total={self.total_comments_posted})>"

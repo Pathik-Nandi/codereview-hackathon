@@ -63,6 +63,21 @@ slack_service = SlackService()
 dashboard_service = DashboardService()
 auto_merge_agent = AutoMergeAgent()
 
+# Initialize PR Comment Agent
+pr_comment_agent = None
+if config.get('pr_comments.enabled', False):
+    try:
+        from agents.pr_comment_agent import PRCommentAgent
+        pr_comment_agent = PRCommentAgent(
+            github_service=github_service,
+            db_service=db_service,
+            config=config.get('pr_comments', {})
+        )
+        logger.info("PR Comment Agent initialized successfully")
+    except Exception as e:
+        logger.error("Failed to initialize PR Comment Agent", error=str(e))
+        logger.warning("Running without automated PR comments")
+
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -362,6 +377,152 @@ def get_user_sessions():
 # PR ANALYSIS ENDPOINTS (Original endpoints below)
 # ============================================================================
 
+def _validate_analyze_request(data):
+    """Validate the analyze request and return repository and pr_number."""
+    if not data:
+        return None, None, jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+    
+    repository = data.get('repository')
+    pr_number = data.get('pr_number')
+    
+    if not repository or not pr_number:
+        return None, None, jsonify({'error': ERROR_MISSING_REPO_PR}), 400
+    
+    return repository, pr_number, None, None
+
+
+def _fetch_pr_event(repository, pr_number):
+    """Fetch PR details from GitHub and create PREvent object."""
+    from datetime import datetime
+    from models.pr_event import PRAuthor
+    
+    pr_details = github_service.get_pr_details(repository, pr_number)
+    
+    if not pr_details:
+        return None, jsonify({
+            'error': f'Could not fetch PR #{pr_number} from {repository}. Check repository name and PR number.'
+        }), 404
+    
+    pr_event = PREvent(
+        action='manual',
+        pr_number=pr_number,
+        pr_title=pr_details.get('title', ''),
+        pr_description=pr_details.get('body', ''),
+        pr_url=f"https://github.com/{repository}/pull/{pr_number}",
+        repository=repository,
+        repository_url=f"https://github.com/{repository}",
+        author=PRAuthor(
+            login=pr_details.get('user', {}).get('login', ''),
+            id=0,
+            avatar_url=''
+        ),
+        base_branch=pr_details.get('base', {}).get('ref', 'main'),
+        head_branch=pr_details.get('head', {}).get('ref', ''),
+        files=[],
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        is_draft=False
+    )
+    
+    pr_event.files = github_service.get_pr_files(repository, pr_number)
+    return (pr_event, pr_details), None, None
+
+
+def _build_response_data(pr_event, pr_details, result):
+    """Build API response data from analysis result."""
+    critical_count = sum(1 for issue in result.issues if issue.severity == 'critical')
+    high_count = sum(1 for issue in result.issues if issue.severity == 'high')
+    medium_count = sum(1 for issue in result.issues if issue.severity == 'medium')
+    low_count = sum(1 for issue in result.issues if issue.severity == 'low')
+    
+    return {
+        'status': 'success',
+        'message': 'Analysis completed',
+        'pr_number': pr_event.pr_number,
+        'repository': pr_event.repository,
+        'agent_used': result.agent_name,
+        'success': result.success,
+        'execution_time': result.execution_time,
+        'issues_found': len(result.issues),
+        'critical_issues': critical_count,
+        'high_issues': high_count,
+        'medium_issues': medium_count,
+        'low_issues': low_count,
+        'issues': [
+            {
+                'file': issue.file,
+                'line': issue.line,
+                'column': issue.column,
+                'type': issue.type.value if hasattr(issue.type, 'value') else str(issue.type),
+                'severity': issue.severity.value if hasattr(issue.severity, 'value') else str(issue.severity),
+                'code': issue.code,
+                'message': issue.message,
+                'suggestion': issue.suggestion,
+                'metadata': issue.metadata
+            }
+            for issue in result.issues
+        ],
+        'metrics': result.metrics,
+        'agent_breakdown': result.metadata.get('agent_breakdown', {}) if result.metadata else {},
+        'error': result.error
+    }
+
+
+def _persist_analysis(pr_event, pr_details, result, data, response_data):
+    """Persist analysis to database using persistence agent."""
+    if not db_persistence_agent:
+        return
+    
+    try:
+        pr_data = {
+            'repository': pr_event.repository,
+            'pr_number': pr_event.pr_number,
+            'title': pr_details.get('title', ''),
+            'description': pr_details.get('body', ''),
+            'url': f"https://github.com/{pr_event.repository}/pull/{pr_event.pr_number}",
+            'author': {
+                'login': pr_details.get('user', {}).get('login', ''),
+                'email': pr_details.get('user', {}).get('email'),
+                'name': pr_details.get('user', {}).get('name'),
+                'id': pr_details.get('user', {}).get('id', 0)
+            },
+            'base_branch': pr_details.get('base', {}).get('ref', 'main'),
+            'head_branch': pr_details.get('head', {}).get('ref', ''),
+            'files_changed': len(pr_event.files),
+            'lines_added': sum(f.additions for f in pr_event.files),
+            'lines_deleted': sum(f.deletions for f in pr_event.files),
+            'is_draft': pr_details.get('draft', False),
+            'created_at': pr_details.get('created_at'),
+            'updated_at': pr_details.get('updated_at')
+        }
+        
+        author_email = data.get('author_email')
+        persistence_result = db_persistence_agent.persist_analysis(
+            pr_data=pr_data,
+            analysis_result=result,
+            author_email=author_email
+        )
+        
+        if persistence_result.get('success'):
+            logger.info(
+                "PR analysis persisted by Database Persistence Agent",
+                pr_analysis_id=persistence_result.get('pr_analysis_id'),
+                repository=pr_event.repository,
+                pr_number=pr_event.pr_number
+            )
+            response_data['database_id'] = persistence_result.get('pr_analysis_id')
+            return persistence_result
+    
+    except Exception as db_error:
+        logger.error(
+            "Database Persistence Agent failed",
+            error=str(db_error),
+            repository=pr_event.repository,
+            pr_number=pr_event.pr_number
+        )
+    return None
+
+
 @app.route('/api/analyze', methods=['POST'])
 def analyze_pr():
     """
@@ -379,16 +540,12 @@ def analyze_pr():
     try:
         data = request.json
         
-        if not data:
-            return jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+        # Validate request
+        repository, pr_number, error_response, error_code = _validate_analyze_request(data)
+        if error_response:
+            return error_response, error_code
         
-        # Extract PR information
-        repository = data.get('repository')
-        pr_number = data.get('pr_number')
-        agent_type = data.get('agent_type')  # Optional
-        
-        if not repository or not pr_number:
-            return jsonify({'error': ERROR_MISSING_REPO_PR}), 400
+        agent_type = data.get('agent_type')
         
         logger.info(
             "Received PR analysis request",
@@ -397,142 +554,59 @@ def analyze_pr():
             requested_agent=agent_type
         )
         
-        # Fetch PR details from GitHub automatically
+        # Fetch PR details and create PR event
         logger.info("Fetching PR details from GitHub...")
-        pr_details = github_service.get_pr_details(repository, pr_number)
+        pr_data_tuple, error_response, error_code = _fetch_pr_event(repository, pr_number)
+        if error_response:
+            return error_response, error_code
         
-        if not pr_details:
-            return jsonify({
-                'error': f'Could not fetch PR #{pr_number} from {repository}. Check repository name and PR number.'
-            }), 404
-        
-        # Create PR event object with fetched details
-        from datetime import datetime
-        from models.pr_event import PRAuthor
-        
-        pr_event = PREvent(
-            action='manual',
-            pr_number=pr_number,
-            pr_title=pr_details.get('title', ''),
-            pr_description=pr_details.get('body', ''),
-            pr_url=f"https://github.com/{repository}/pull/{pr_number}",
-            repository=repository,
-            repository_url=f"https://github.com/{repository}",
-            author=PRAuthor(
-                login=pr_details.get('user', {}).get('login', ''),
-                id=0,
-                avatar_url=''
-            ),
-            base_branch=pr_details.get('base', {}).get('ref', 'main'),
-            head_branch=pr_details.get('head', {}).get('ref', ''),
-            files=[],
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            is_draft=False
-        )
-        
-        # Get PR files from GitHub
-        pr_event.files = github_service.get_pr_files(repository, pr_number)
+        pr_event, pr_details = pr_data_tuple
         
         # Dispatch to agent
         result = dispatcher.dispatch(pr_event, agent_type)
         
-        # Skip feedback for now - just return response
-        # send_feedback(pr_event, result)
+        # Build response
+        response_data = _build_response_data(pr_event, pr_details, result)
         
-        # Count issues by severity
-        critical_count = sum(1 for issue in result.issues if issue.severity == 'critical')
-        high_count = sum(1 for issue in result.issues if issue.severity == 'high')
-        medium_count = sum(1 for issue in result.issues if issue.severity == 'medium')
-        low_count = sum(1 for issue in result.issues if issue.severity == 'low')
+        # Persist to database
+        persistence_result = _persist_analysis(pr_event, pr_details, result, data, response_data)
         
-        # Prepare response
-        response_data = {
-            'status': 'success',
-            'message': 'Analysis completed',
-            'pr_number': pr_number,
-            'repository': repository,
-            'agent_used': result.agent_name,
-            'success': result.success,
-            'execution_time': result.execution_time,
-            'issues_found': len(result.issues),
-            'critical_issues': critical_count,
-            'high_issues': high_count,
-            'medium_issues': medium_count,
-            'low_issues': low_count,
-            'issues': [
-                {
-                    'file': issue.file,
-                    'line': issue.line,
-                    'column': issue.column,
-                    'type': issue.type.value if hasattr(issue.type, 'value') else str(issue.type),
-                    'severity': issue.severity.value if hasattr(issue.severity, 'value') else str(issue.severity),
-                    'code': issue.code,
-                    'message': issue.message,
-                    'suggestion': issue.suggestion,
-                    'metadata': issue.metadata
-                }
-                for issue in result.issues
-            ],
-            'metrics': result.metrics,
-            'agent_breakdown': result.metadata.get('agent_breakdown', {}) if result.metadata else {},
-            'error': result.error
-        }
-        
-        # Save to database using persistence agent if enabled
-        persistence_result = None
-        if db_persistence_agent:
+        # Post comments to PR if enabled
+        if pr_comment_agent and data.get('post_comments', False):
             try:
-                # Prepare PR data for database
-                pr_data = {
-                    'repository': repository,
-                    'pr_number': pr_number,
-                    'title': pr_details.get('title', ''),
-                    'description': pr_details.get('body', ''),
-                    'url': f"https://github.com/{repository}/pull/{pr_number}",
-                    'author': {
-                        'login': pr_details.get('user', {}).get('login', ''),
-                        'email': pr_details.get('user', {}).get('email'),
-                        'name': pr_details.get('user', {}).get('name'),
-                        'id': pr_details.get('user', {}).get('id', 0)
-                    },
-                    'base_branch': pr_details.get('base', {}).get('ref', 'main'),
-                    'head_branch': pr_details.get('head', {}).get('ref', ''),
-                    'files_changed': len(pr_event.files),
-                    'lines_added': sum(f.additions for f in pr_event.files),
-                    'lines_deleted': sum(f.deletions for f in pr_event.files),
-                    'is_draft': pr_details.get('draft', False),
-                    'created_at': pr_details.get('created_at'),
-                    'updated_at': pr_details.get('updated_at')
-                }
+                # Get head commit SHA from PR details
+                head_sha = None
+                if 'head' in pr_details and 'sha' in pr_details['head']:
+                    head_sha = pr_details['head']['sha']
                 
-                # Get author email from additional field if provided
-                author_email = data.get('author_email')
+                # Get pr_analysis_id from persistence result
+                pr_analysis_id = persistence_result.get('pr_analysis_id') if persistence_result else None
                 
-                # Use persistence agent to save
-                persistence_result = db_persistence_agent.persist_analysis(
-                    pr_data=pr_data,
-                    analysis_result=result,
-                    author_email=author_email
+                comment_result = pr_comment_agent.post_analysis_comments(
+                    pr_event=pr_event,
+                    agent_result=result,
+                    commit_sha=head_sha,
+                    pr_analysis_id=pr_analysis_id
                 )
                 
-                if persistence_result.get('success'):
-                    logger.info(
-                        "PR analysis persisted by Database Persistence Agent",
-                        pr_analysis_id=persistence_result.get('pr_analysis_id'),
-                        repository=repository,
-                        pr_number=pr_number
-                    )
-                    response_data['database_id'] = persistence_result.get('pr_analysis_id')
+                response_data['comments_posted'] = comment_result
+                logger.info(
+                    "Posted PR comments",
+                    repository=repository,
+                    pr_number=pr_number,
+                    summary_posted=comment_result.get('summary_posted'),
+                    inline_count=comment_result.get('inline_comments_posted')
+                )
                 
-            except Exception as db_error:
+            except Exception as comment_error:
                 logger.error(
-                    "Database Persistence Agent failed",
-                    error=str(db_error),
+                    "Failed to post PR comments",
+                    error=str(comment_error),
                     repository=repository,
                     pr_number=pr_number
                 )
                 # Continue without failing the request
+                response_data['comments_error'] = str(comment_error)
         
         return jsonify(response_data), 200
         

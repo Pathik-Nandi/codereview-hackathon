@@ -209,7 +209,15 @@ frontend/
    - Historical comparison
    - Best practices identification
 
-3. **Auto-Merge Agent** (`auto_merge_agent.py`)
+3. **PR Comment Agent** (`pr_comment_agent.py`)
+   - Posts analysis results as GitHub PR comments
+   - Summary comment with overall findings
+   - Inline comments on specific lines
+   - Smart review creation (REQUEST_CHANGES if critical issues)
+   - Configurable severity thresholds
+   - Emoji-enhanced formatting for readability
+
+4. **Auto-Merge Agent** (`auto_merge_agent.py`)
    - Automated PR merging (optional)
    - Conditional merge logic based on quality scores
    - Configurable thresholds
@@ -437,6 +445,44 @@ Database Persistence Agent (in main.py)
         ├─ rag_learned_patterns
         ├─ rag_recommendations
         └─ rag_similar_pr_references
+```
+
+### 4. PR Comment Flow (Optional)
+
+```
+Analysis Complete
+    │
+    ▼
+PR Comment Agent (if enabled)
+    │
+    ├─ Build Summary Comment
+    │   ├─ Total issues by severity
+    │   ├─ Issues by type (security, quality, etc.)
+    │   ├─ RAG insights (novelty, risk, similar PRs)
+    │   └─ Key recommendations
+    │
+    ├─ Build Inline Comments
+    │   ├─ Extract file + line from each issue
+    │   ├─ Format with severity emoji
+    │   ├─ Add suggestion if available
+    │   └─ Filter by severity threshold
+    │
+    ├─ Prioritize & Limit
+    │   ├─ Sort by severity (CRITICAL first)
+    │   └─ Limit to max_inline_comments (default 50)
+    │
+    └─ Post to GitHub
+        │
+        ├─► Post Summary Comment
+        │   └─ General PR comment
+        │
+        └─► Create Review with Inline Comments
+            ├─ Event: REQUEST_CHANGES (if critical issues)
+            ├─ Event: COMMENT (otherwise)
+            └─ All inline comments in one review
+    │
+    ▼
+Developer sees comments in GitHub PR
 ```
 
 ---

@@ -427,4 +427,133 @@ class GitHubService:
                 'total_count': 0,
                 'statuses': []
             }
+    
+    def post_inline_comment(
+        self, 
+        repository: str, 
+        pr_number: int, 
+        commit_sha: str,
+        file_path: str,
+        line_number: int,
+        comment_body: str,
+        side: str = "RIGHT"
+    ) -> bool:
+        """
+        Post an inline comment on a specific line of a PR file.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            commit_sha: Commit SHA to comment on
+            file_path: Path to the file
+            line_number: Line number to comment on
+            comment_body: Comment text
+            side: Which side of diff (RIGHT for new, LEFT for old)
+            
+        Returns:
+            True if successful
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            
+            # Create review comment on specific line
+            pr.create_review_comment(
+                body=comment_body,
+                commit=repo.get_commit(commit_sha),
+                path=file_path,
+                line=line_number,
+                side=side
+            )
+            
+            self.logger.info(
+                "Posted inline PR comment",
+                repository=repository,
+                pr_number=pr_number,
+                file=file_path,
+                line=line_number
+            )
+            
+            return True
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to post inline comment",
+                repository=repository,
+                pr_number=pr_number,
+                file=file_path,
+                line=line_number,
+                error=str(e)
+            )
+            return False
+    
+    def post_review_with_comments(
+        self, 
+        repository: str, 
+        pr_number: int,
+        commit_sha: str,
+        review_body: str,
+        review_event: str = "COMMENT",
+        inline_comments: Optional[list] = None
+    ) -> bool:
+        """
+        Post a review with multiple inline comments at once.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            commit_sha: Commit SHA to review
+            review_body: Main review body text
+            review_event: APPROVE, REQUEST_CHANGES, or COMMENT
+            inline_comments: List of dicts with keys:
+                - path: str (file path)
+                - line: int (line number)
+                - body: str (comment text)
+                - side: str (optional, defaults to "RIGHT")
+            
+        Returns:
+            True if successful
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            commit = repo.get_commit(commit_sha)
+            
+            # Build comments list for review
+            comments = []
+            if inline_comments:
+                for comment in inline_comments:
+                    comments.append({
+                        'path': comment['path'],
+                        'line': comment['line'],
+                        'body': comment['body'],
+                        'side': comment.get('side', 'RIGHT')
+                    })
+            
+            # Create review with all comments
+            pr.create_review(
+                body=review_body,
+                event=review_event,
+                commit=commit,
+                comments=comments if comments else None
+            )
+            
+            self.logger.info(
+                "Posted PR review with inline comments",
+                repository=repository,
+                pr_number=pr_number,
+                review_event_type=review_event,
+                comment_count=len(comments)
+            )
+            
+            return True
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to post review with comments",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            return False
 

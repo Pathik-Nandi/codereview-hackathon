@@ -144,6 +144,21 @@ feedback_aggregator:
   group_by_severity: true
   include_suggestions: true
 
+# PR Comments Configuration
+pr_comments:
+  enabled: true  # Enable/disable automated PR commenting
+  track_in_database: true  # Track all posted comments in database for analytics
+  post_summary: true  # Post a summary comment on the PR
+  post_inline_comments: true  # Post inline comments on specific lines
+  max_inline_comments: 500  # Maximum number of inline comments per PR
+  severity_threshold: "LOW"  # Minimum severity to comment: CRITICAL, HIGH, MEDIUM, LOW, INFO
+  group_by_file: true  # Group comments by file
+  include_rag_insights: true  # Include RAG insights in summary
+  # Review behavior:
+  # - REQUEST_CHANGES if critical issues found
+  # - COMMENT for all other cases
+  # - Never auto-approves (requires manual review)
+
 output:
   github:
     enabled: true

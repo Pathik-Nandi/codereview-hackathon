@@ -47,6 +47,7 @@ sys.path.insert(0, str(project_root))
 from models.pr_event import PREvent, PRFile, PRAuthor
 from agents.dispatcher import AgentDispatcher
 from agents.database_persistence_agent import DatabasePersistenceAgent
+from agents.pr_comment_agent import PRCommentAgent
 from services.database_service import DatabaseService
 from services.github_service import GitHubService
 from utils.logger import logger
@@ -327,17 +328,50 @@ def persist_results(pr_event, analysis_results, db_agent, author_email=None, aut
             print("  ✓ Persisted to database")
         else:
             print(f"  ✗ Failed to persist to database: {db_result.get('error')}")
-            return False
+            return None
         
         # Trigger analytics processing
         _trigger_analytics_processing(pr_event, author_email, author_name)
         
-        return True
+        # Return pr_analysis_id for comment posting
+        return db_result.get('pr_analysis_id')
         
     except Exception as e:
         print(f"  Error persisting PR #{pr_event.pr_number}: {e}")
         logger.error(f"Persistence failed for PR #{pr_event.pr_number}", error=str(e))
+        return None
+
+
+def post_pr_comments(pr_event, analysis_results, pr_analysis_id, commit_sha, comment_agent):
+    """Post analysis comments to the PR on GitHub."""
+    try:
+        print(f"  Posting comments to PR #{pr_event.pr_number}...")
+        
+        # Post comments using PR Comment Agent
+        comment_result = comment_agent.post_analysis_comments(
+            pr_event=pr_event,
+            agent_result=analysis_results,
+            commit_sha=commit_sha,
+            pr_analysis_id=pr_analysis_id
+        )
+        
+        if comment_result.get('success'):
+            summary_posted = comment_result.get('summary_posted', False)
+            inline_posted = comment_result.get('inline_comments_posted', 0)
+            
+            print(f"  ✓ Posted comments: Summary={'✓' if summary_posted else '✗'}, Inline={inline_posted}")
+            
+            return True
+        else:
+            error_msg = comment_result.get('error', 'Unknown error')
+            print(f"  ✗ Failed to post comments: {error_msg}")
+            return False
+            
+    except Exception as e:
+        print(f"  ✗ Error posting comments to PR #{pr_event.pr_number}: {e}")
+        logger.error(f"Comment posting failed for PR #{pr_event.pr_number}", error=str(e))
         return False
+
 
 
 def _trigger_analytics_processing(pr_event, author_email, author_name):
@@ -501,28 +535,36 @@ def _handle_existing_pr(pr_number, existing_pr_id):
         return 'create'
 
 
-def _persist_pr_results(pr_number, pr_event, analysis_results, db_agent, db_service, existing_pr_id, author_email, author_name, action):
-    """Persist PR results to database (create or update)."""
+def _persist_pr_results(pr_number, pr_event, analysis_results, db_agent, db_service, existing_pr_id, author_email, author_name, action, commit_sha, comment_agent):
+    """Persist PR results to database (create or update) and post comments."""
+    pr_analysis_id = None
+    
     if action == 'update':
         if update_pr_analysis(existing_pr_id, pr_event, analysis_results, db_service, author_email, author_name):
             stats['updated'] += 1
             stats['persisted'] += 1
+            pr_analysis_id = existing_pr_id
             print(f"  ✓ PR #{pr_number} updated successfully")
-            return True
         else:
             stats['failed'] += 1
             return False
     else:  # action == 'create'
-        if persist_results(pr_event, analysis_results, db_agent, author_email, author_name):
+        pr_analysis_id = persist_results(pr_event, analysis_results, db_agent, author_email, author_name)
+        if pr_analysis_id:
             stats['persisted'] += 1
             print(f"  ✓ PR #{pr_number} completed successfully")
-            return True
         else:
             stats['failed'] += 1
             return False
+    
+    # Post comments to GitHub PR (if persistence was successful)
+    if pr_analysis_id and comment_agent:
+        post_pr_comments(pr_event, analysis_results, pr_analysis_id, commit_sha, comment_agent)
+    
+    return True
 
 
-def process_pr(pr_number, dispatcher, db_agent, db_service):
+def process_pr(pr_number, dispatcher, db_agent, db_service, comment_agent):
     """Fetch, analyze, and persist a single PR."""
     try:
         print(f"\n📋 Processing PR #{pr_number}...")
@@ -562,13 +604,16 @@ def process_pr(pr_number, dispatcher, db_agent, db_service):
         
         stats['analyzed'] += 1
         
-        # Step 5: Persist to database with email and name
+        # Step 5: Extract commit SHA for comment posting
+        commit_sha = pr_data.get('head', {}).get('sha')
+        
+        # Step 6: Persist to database with email and name
         author_email = pr_data.get('user', {}).get('email')
         author_name = pr_data.get('user', {}).get('name') or pr_event.author.login
         
         return _persist_pr_results(
             pr_number, pr_event, analysis_results, db_agent, db_service,
-            existing_pr_id if exists else None, author_email, author_name, action
+            existing_pr_id if exists else None, author_email, author_name, action, commit_sha, comment_agent
         )
         
     except Exception as e:
@@ -585,8 +630,16 @@ def _initialize_services():
         db_service = DatabaseService()
         dispatcher = AgentDispatcher(db_service=db_service)
         db_agent = DatabasePersistenceAgent(db_service)
+        
+        # Initialize GitHub service and PR Comment Agent
+        github_service = GitHubService()
+        comment_agent = PRCommentAgent(
+            github_service=github_service,
+            db_service=db_service
+        )
+        
         print("✓ Services initialized")
-        return db_service, dispatcher, db_agent
+        return db_service, dispatcher, db_agent, comment_agent
     except Exception as e:
         print(f"❌ Error initializing services: {e}")
         sys.exit(1)
@@ -651,7 +704,7 @@ def main():
         sys.exit(1)
     
     # Initialize services
-    db_service, dispatcher, db_agent = _initialize_services()
+    db_service, dispatcher, db_agent, comment_agent = _initialize_services()
     
     # Process PRs
     print(f"\n🚀 Starting to process {END_PR - START_PR + 1} PRs...\n")
@@ -661,7 +714,7 @@ def main():
     stats['total'] = END_PR - START_PR + 1
     
     for pr_number in range(START_PR, END_PR + 1):
-        process_pr(pr_number, dispatcher, db_agent, db_service)
+        process_pr(pr_number, dispatcher, db_agent, db_service, comment_agent)
         
         # Delay between requests to respect rate limits
         if pr_number < END_PR:

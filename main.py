@@ -1,6 +1,7 @@
 """Main application entry point."""
 import time
 from datetime import datetime, timedelta
+from typing import Optional
 from uuid import UUID
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -1961,6 +1962,203 @@ def get_pr_details():
     except Exception as e:
         logger.error("Failed to fetch PR details", error=str(e), pr_number=pr_number)
         return jsonify({'error': 'Failed to fetch PR details'}), 500
+
+
+def _extract_code_context(file_content: dict, line_number: int, context_lines: int = 3) -> Optional[dict]:
+    """
+    Extract code context around a specific line from file content.
+    
+    Args:
+        file_content: File content dictionary with 'lines' array
+        line_number: Target line number
+        context_lines: Number of lines to include before and after
+        
+    Returns:
+        Code context dictionary or None
+    """
+    if not file_content or 'lines' not in file_content:
+        return None
+    
+    lines = file_content['lines']
+    total_lines = len(lines)
+    
+    # Calculate line range
+    start_line = max(1, line_number - context_lines)
+    end_line = min(total_lines, line_number + context_lines)
+    
+    # Extract lines
+    code_lines = []
+    for i in range(start_line - 1, end_line):
+        if i < len(lines):
+            code_lines.append({
+                'line_number': i + 1,
+                'content': lines[i],
+                'is_target': (i + 1) == line_number
+            })
+    
+    return {
+        'file_path': file_content.get('file_path'),
+        'target_line': line_number,
+        'start_line': start_line,
+        'end_line': end_line,
+        'lines': code_lines,
+        'total_lines': total_lines
+    }
+
+
+@app.route('/api/prs/comments', methods=['POST'])
+def get_pr_comments():
+    """
+    Get comments for a specific PR with code context.
+    
+    Request Body:
+    {
+        "pr_number": 123,
+        "repository": "owner/repo"  // optional
+    }
+    
+    Response:
+    {
+        "success": true,
+        "pr_number": 123,
+        "repository": "owner/repo",
+        "total_comments": 15,
+        "comments": [
+            {
+                "id": 1,
+                "comment_type": "inline",
+                "file_path": "src/main.py",
+                "line_number": 45,
+                "comment_body": "Consider using a more descriptive variable name",
+                "issue_severity": "medium",
+                "issue_type": "code_quality",
+                "posted_at": "2024-12-20T10:30:00Z",
+                "github_url": "https://github.com/...",
+                "reactions_count": 2,
+                "replies_count": 1,
+                "was_resolved": false,
+                "code_context": {
+                    "target_line": 45,
+                    "start_line": 42,
+                    "end_line": 48,
+                    "lines": [
+                        {"line_number": 42, "content": "def process():", "is_target": false},
+                        {"line_number": 43, "content": "    x = 10", "is_target": false},
+                        {"line_number": 44, "content": "    y = 20", "is_target": false},
+                        {"line_number": 45, "content": "    z = x + y", "is_target": true},
+                        ...
+                    ]
+                }
+            },
+            ...
+        ]
+    }
+    """
+    if not db_service:
+        return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        data = request.json
+        
+        if not data or 'pr_number' not in data:
+            return jsonify({'error': 'pr_number is required in request body'}), 400
+        
+        pr_number = data.get('pr_number')
+        repository = data.get('repository')
+        
+        # Get PR and its comments from database
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis, PRComment
+            
+            query = session.query(PRAnalysis).filter_by(pr_number=pr_number)
+            
+            if repository:
+                query = query.filter_by(repository=repository)
+            
+            pr = query.first()
+            
+            if not pr:
+                return jsonify({
+                    'error': 'PR not found',
+                    'pr_number': pr_number,
+                    'repository': repository
+                }), 404
+            
+            # Get comments for this PR
+            comments = session.query(PRComment).filter_by(
+                pr_analysis_id=pr.id
+            ).order_by(PRComment.file_path, PRComment.line_number).all()
+            
+            # Check if code context is requested (optional for performance)
+            include_code = data.get('include_code', False)
+            
+            # Format comments with optional code context
+            comments_list = []
+            
+            # Cache for file contents to avoid redundant GitHub API calls
+            file_cache = {}
+            
+            for comment in comments:
+                comment_dict = {
+                    'id': comment.id,
+                    'comment_type': comment.comment_type,
+                    'file_path': comment.file_path,
+                    'line_number': comment.line_number,
+                    'commit_sha': comment.commit_sha,
+                    'comment_body': comment.comment_body,
+                    'comment_preview': comment.comment_preview,
+                    'issue_severity': comment.issue_severity,
+                    'issue_type': comment.issue_type,
+                    'posted_successfully': comment.posted_successfully,
+                    'review_event': comment.review_event,
+                    'github_url': comment.github_url,
+                    'reactions_count': comment.reactions_count,
+                    'replies_count': comment.replies_count,
+                    'was_edited': comment.was_edited,
+                    'was_resolved': comment.was_resolved,
+                    'resolved_at': comment.resolved_at.isoformat() if comment.resolved_at else None,
+                    'posted_at': comment.posted_at.isoformat() if comment.posted_at else None,
+                    'github_comment_id': comment.github_comment_id,
+                    'github_review_id': comment.github_review_id
+                }
+                
+                # Fetch code context from GitHub if requested and we have the necessary info
+                if include_code and github_service and comment.file_path and comment.line_number and comment.commit_sha:
+                    # Create cache key for this file at this commit
+                    cache_key = f"{comment.commit_sha}:{comment.file_path}"
+                    
+                    # Get file content from cache or fetch it
+                    if cache_key not in file_cache:
+                        file_cache[cache_key] = github_service.get_file_content_at_commit(
+                            repository=pr.repository,
+                            file_path=comment.file_path,
+                            commit_sha=comment.commit_sha
+                        )
+                    
+                    # Extract lines around the comment line from cached content
+                    file_content = file_cache[cache_key]
+                    if file_content:
+                        code_context = _extract_code_context(
+                            file_content, 
+                            comment.line_number, 
+                            context_lines=3
+                        )
+                        if code_context:
+                            comment_dict['code_context'] = code_context
+                
+                comments_list.append(comment_dict)
+            
+            return jsonify({
+                'success': True,
+                'pr_number': pr.pr_number,
+                'repository': pr.repository,
+                'total_comments': len(comments_list),
+                'comments': comments_list
+            }), 200
+            
+    except Exception as e:
+        logger.error("Failed to fetch PR comments", error=str(e), pr_number=pr_number)
+        return jsonify({'error': 'Failed to fetch PR comments'}), 500
 
 
 @app.route('/api/analytics/user', methods=['POST'])

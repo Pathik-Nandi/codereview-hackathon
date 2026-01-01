@@ -556,4 +556,133 @@ class GitHubService:
                 error=str(e)
             )
             return False
+    
+    def get_file_content_at_commit(
+        self,
+        repository: str,
+        file_path: str,
+        commit_sha: str
+    ) -> Optional[dict]:
+        """
+        Get entire file content at a specific commit (for caching).
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            file_path: Path to file in repository
+            commit_sha: Commit SHA to get content from
+            
+        Returns:
+            Dictionary with file lines or None if not found
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            
+            # Get file content at specific commit
+            file_content = repo.get_contents(file_path, ref=commit_sha)
+            
+            if file_content.type != "file":
+                return None
+            
+            # Decode content
+            content = file_content.decoded_content.decode('utf-8')
+            lines = content.split('\n')
+            
+            return {
+                'file_path': file_path,
+                'lines': lines,
+                'total_lines': len(lines)
+            }
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to get file content at commit",
+                repository=repository,
+                file_path=file_path,
+                commit_sha=commit_sha,
+                error=str(e)
+            )
+            return None
+        except Exception as e:
+            self.logger.error(
+                "Unexpected error getting file content",
+                repository=repository,
+                file_path=file_path,
+                error=str(e)
+            )
+            return None
+
+    def get_file_content_at_line(
+        self, 
+        repository: str, 
+        file_path: str, 
+        line_number: int, 
+        commit_sha: str,
+        context_lines: int = 3
+    ) -> Optional[dict]:
+        """
+        Get file content around a specific line.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            file_path: Path to file in repository
+            line_number: Line number to get context for
+            commit_sha: Commit SHA to get content from
+            context_lines: Number of lines to include before and after
+            
+        Returns:
+            Dictionary with code lines or None if not found
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            
+            # Get file content at specific commit
+            file_content = repo.get_contents(file_path, ref=commit_sha)
+            
+            if file_content.type != "file":
+                return None
+            
+            # Decode content
+            content = file_content.decoded_content.decode('utf-8')
+            lines = content.split('\n')
+            
+            # Calculate line range
+            start_line = max(1, line_number - context_lines)
+            end_line = min(len(lines), line_number + context_lines)
+            
+            # Extract lines with numbers
+            code_lines = []
+            for i in range(start_line - 1, end_line):
+                code_lines.append({
+                    'line_number': i + 1,
+                    'content': lines[i] if i < len(lines) else '',
+                    'is_target': (i + 1) == line_number
+                })
+            
+            return {
+                'file_path': file_path,
+                'target_line': line_number,
+                'start_line': start_line,
+                'end_line': end_line,
+                'lines': code_lines,
+                'total_lines': len(lines)
+            }
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to get file content",
+                repository=repository,
+                file_path=file_path,
+                line_number=line_number,
+                commit_sha=commit_sha,
+                error=str(e)
+            )
+            return None
+        except Exception as e:
+            self.logger.error(
+                "Unexpected error getting file content",
+                repository=repository,
+                file_path=file_path,
+                error=str(e)
+            )
+            return None
 

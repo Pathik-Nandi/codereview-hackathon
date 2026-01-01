@@ -1033,7 +1033,6 @@ def get_pr_analysis(repository: str, pr_number: int):
         return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
     
     try:
-        # Get analysis within a managed session context
         with db_service.get_session() as session:
             pr_analysis = session.query(PRAnalysis).filter_by(
                 repository=repository,
@@ -1043,75 +1042,112 @@ def get_pr_analysis(repository: str, pr_number: int):
             if not pr_analysis:
                 return jsonify({'error': 'PR analysis not found'}), 404
             
-            # Access all attributes while session is active
-            result = {
-                'id': pr_analysis.id,
-                'repository': pr_analysis.repository,
-                'pr_number': pr_analysis.pr_number,
-                'pr_title': pr_analysis.pr_title,
-                'pr_url': pr_analysis.pr_url,
-                'author_login': pr_analysis.author_login,
-                'author_email': pr_analysis.author_email,
-                'total_issues': pr_analysis.total_issues,
-                'severity_distribution': {
-                    'critical': pr_analysis.critical_issues,
-                    'high': pr_analysis.high_issues,
-                    'medium': pr_analysis.medium_issues,
-                    'low': pr_analysis.low_issues
-                },
-                'agent_breakdown': {
-                    'static_analysis': pr_analysis.static_analysis_issues,
-                    'security': pr_analysis.security_issues,
-                    'code_quality': pr_analysis.code_quality_issues,
-                    'context': pr_analysis.context_issues,
-                    'coverage': pr_analysis.coverage_issues
-                },
-                'scores': {
-                    'overall_quality': pr_analysis.overall_quality_score,
-                    'security': pr_analysis.security_score,
-                    'maintainability': pr_analysis.maintainability_score
-                },
-                'coverage_metrics': {
-                    'estimated_coverage': pr_analysis.estimated_coverage,
-                    'test_to_code_ratio': pr_analysis.test_to_code_ratio,
-                    'complexity_score': pr_analysis.complexity_score
-                },
-                'analyzed_at': pr_analysis.analyzed_at.isoformat(),
-                'analysis_duration_ms': pr_analysis.analysis_duration_ms
-            }
-            
-            # Add RAG insights if available
-            if pr_analysis.has_rag_insights or pr_analysis.rag_insights:
-                rag_insights_data = pr_analysis.rag_insights or {}
-                
-                # Generate summary from full_text if not present
-                summary = rag_insights_data.get('summary')
-                if not summary and 'full_text' in rag_insights_data:
-                    full_text = rag_insights_data['full_text']
-                    if full_text:
-                        lines = full_text.split('\n')
-                        for line in lines:
-                            line = line.strip()
-                            if line and not line.startswith('#') and len(line) > 20:
-                                summary = line
-                                break
-                        if not summary:
-                            summary = full_text[:200].strip() + '...'
-                
-                result['rag_insights'] = {
-                    'has_insights': pr_analysis.has_rag_insights or bool(pr_analysis.rag_insights),
-                    'risk_score': pr_analysis.rag_risk_score,
-                    'novelty_score': pr_analysis.rag_novelty_score,
-                    'summary': summary,
-                    'insights': rag_insights_data
-                }
-            else:
-                result['rag_insights'] = None
-            
+            result = _build_pr_analysis_response(pr_analysis)
             return jsonify(result), 200
     except Exception as e:
         logger.error("Failed to get PR analysis", error=str(e), repository=repository, pr_number=pr_number)
         return jsonify({'error': 'Failed to retrieve analysis'}), 500
+
+
+def _build_pr_analysis_response(pr_analysis: PRAnalysis) -> dict:
+    """Build PR analysis response dictionary."""
+    result = {
+        'id': pr_analysis.id,
+        'repository': pr_analysis.repository,
+        'pr_number': pr_analysis.pr_number,
+        'pr_title': pr_analysis.pr_title,
+        'pr_url': pr_analysis.pr_url,
+        'author_login': pr_analysis.author_login,
+        'author_email': pr_analysis.author_email,
+        'total_issues': pr_analysis.total_issues,
+        'severity_distribution': _get_severity_distribution(pr_analysis),
+        'agent_breakdown': _get_agent_breakdown(pr_analysis),
+        'scores': _get_scores(pr_analysis),
+        'coverage_metrics': _get_coverage_metrics(pr_analysis),
+        'analyzed_at': pr_analysis.analyzed_at.isoformat(),
+        'analysis_duration_ms': pr_analysis.analysis_duration_ms
+    }
+    
+    # Add RAG insights if available
+    result['rag_insights'] = _get_rag_insights_for_response(pr_analysis)
+    
+    return result
+
+
+def _get_severity_distribution(pr_analysis: PRAnalysis) -> dict:
+    """Extract severity distribution from PR analysis."""
+    return {
+        'critical': pr_analysis.critical_issues,
+        'high': pr_analysis.high_issues,
+        'medium': pr_analysis.medium_issues,
+        'low': pr_analysis.low_issues
+    }
+
+
+def _get_agent_breakdown(pr_analysis: PRAnalysis) -> dict:
+    """Extract agent breakdown from PR analysis."""
+    return {
+        'static_analysis': pr_analysis.static_analysis_issues,
+        'security': pr_analysis.security_issues,
+        'code_quality': pr_analysis.code_quality_issues,
+        'context': pr_analysis.context_issues,
+        'coverage': pr_analysis.coverage_issues
+    }
+
+
+def _get_scores(pr_analysis: PRAnalysis) -> dict:
+    """Extract quality scores from PR analysis."""
+    return {
+        'overall_quality': pr_analysis.overall_quality_score,
+        'security': pr_analysis.security_score,
+        'maintainability': pr_analysis.maintainability_score
+    }
+
+
+def _get_coverage_metrics(pr_analysis: PRAnalysis) -> dict:
+    """Extract coverage metrics from PR analysis."""
+    return {
+        'estimated_coverage': pr_analysis.estimated_coverage,
+        'test_to_code_ratio': pr_analysis.test_to_code_ratio,
+        'complexity_score': pr_analysis.complexity_score
+    }
+
+
+def _get_rag_insights_for_response(pr_analysis: PRAnalysis) -> Optional[dict]:
+    """Get RAG insights formatted for API response."""
+    if not pr_analysis.has_rag_insights and not pr_analysis.rag_insights:
+        return None
+    
+    rag_insights_data = pr_analysis.rag_insights or {}
+    summary = _generate_summary_from_rag_data(rag_insights_data)
+    
+    return {
+        'has_insights': pr_analysis.has_rag_insights or bool(pr_analysis.rag_insights),
+        'risk_score': pr_analysis.rag_risk_score,
+        'novelty_score': pr_analysis.rag_novelty_score,
+        'summary': summary,
+        'insights': rag_insights_data
+    }
+
+
+def _generate_summary_from_rag_data(rag_insights_data: dict) -> str:
+    """Generate summary from RAG insights full_text if not present."""
+    summary = rag_insights_data.get('summary')
+    if not summary and 'full_text' in rag_insights_data:
+        full_text = rag_insights_data['full_text']
+        if full_text:
+            summary = _extract_summary_from_text(full_text)
+    return summary
+
+
+def _extract_summary_from_text(full_text: str) -> str:
+    """Extract summary from full text by finding first substantial line."""
+    lines = full_text.split('\n')
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith('#') and len(line) > 20:
+            return line
+    return full_text[:200].strip() + '...' if full_text else ''
 
 
 @app.route('/api/dashboard/init-db', methods=['POST'])
@@ -1688,64 +1724,71 @@ def _get_rag_insights(session, pr):
         rag_result = _fetch_rag_table_data(session, pr.id)
         
         if rag_result:
-            rag_insight_id = rag_result[0]
-            similar_prs_result = _fetch_similar_prs(session, rag_insight_id)
-            recommendations_result = _fetch_rag_recommendations(session, rag_insight_id)
-            
-            return _build_rag_insights_data(
-                session, pr, rag_result, similar_prs_result, 
-                recommendations_result, rag_json
-            )
+            return _build_rag_from_table_data(session, pr, rag_result, rag_json)
         else:
-            # If no table data, use JSON field entirely
-            rag_insights_data = rag_json.copy()
-            rag_insights_data['risk_score'] = pr.rag_risk_score
-            rag_insights_data['novelty_score'] = pr.rag_novelty_score
-            
-            # Generate summary from full_text if not present or empty
-            if 'full_text' in rag_insights_data and not rag_insights_data.get('summary'):
-                full_text = rag_insights_data['full_text']
-                # Extract first paragraph or first 200 chars as summary
-                if full_text:
-                    lines = full_text.split('\n')
-                    # Find first substantial paragraph
-                    summary = ''
-                    for line in lines:
-                        line = line.strip()
-                        if line and not line.startswith('#') and len(line) > 20:
-                            summary = line
-                            break
-                    if not summary and full_text:
-                        summary = full_text[:200].strip() + '...'
-                    rag_insights_data['summary'] = summary
-            
-            return rag_insights_data
+            return _build_rag_from_json_data(pr, rag_json)
             
     except Exception as e:
         logger.error(f"Error fetching RAG insights: {e}")
-        # Fall back to using pr.rag_insights JSON field if available
-        if pr.rag_insights:
-            rag_insights_data = pr.rag_insights.copy()
-            rag_insights_data['risk_score'] = pr.rag_risk_score
-            rag_insights_data['novelty_score'] = pr.rag_novelty_score
-            
-            # Generate summary from full_text if not present or empty
-            if 'full_text' in rag_insights_data and not rag_insights_data.get('summary'):
-                full_text = rag_insights_data['full_text']
-                if full_text:
-                    lines = full_text.split('\n')
-                    summary = ''
-                    for line in lines:
-                        line = line.strip()
-                        if line and not line.startswith('#') and len(line) > 20:
-                            summary = line
-                            break
-                    if not summary:
-                        summary = full_text[:200].strip() + '...'
-                    rag_insights_data['summary'] = summary
-            
-            return rag_insights_data
+        return _build_rag_fallback_data(pr)
+
+
+def _build_rag_from_table_data(session, pr, rag_result, rag_json):
+    """Build RAG insights from database table data."""
+    rag_insight_id = rag_result[0]
+    similar_prs_result = _fetch_similar_prs(session, rag_insight_id)
+    recommendations_result = _fetch_rag_recommendations(session, rag_insight_id)
+    
+    return _build_rag_insights_data(
+        session, pr, rag_result, similar_prs_result, 
+        recommendations_result, rag_json
+    )
+
+
+def _build_rag_from_json_data(pr, rag_json):
+    """Build RAG insights from JSON field."""
+    rag_insights_data = rag_json.copy()
+    rag_insights_data['risk_score'] = pr.rag_risk_score
+    rag_insights_data['novelty_score'] = pr.rag_novelty_score
+    
+    # Generate summary from full_text if needed
+    _add_summary_to_rag_data(rag_insights_data)
+    
+    return rag_insights_data
+
+
+def _build_rag_fallback_data(pr):
+    """Build RAG insights from fallback data when error occurs."""
+    if not pr.rag_insights:
         return None
+    
+    rag_insights_data = pr.rag_insights.copy()
+    rag_insights_data['risk_score'] = pr.rag_risk_score
+    rag_insights_data['novelty_score'] = pr.rag_novelty_score
+    
+    # Generate summary from full_text if needed
+    _add_summary_to_rag_data(rag_insights_data)
+    
+    return rag_insights_data
+
+
+def _add_summary_to_rag_data(rag_insights_data):
+    """Add summary to RAG data if not present or empty."""
+    if 'full_text' in rag_insights_data and not rag_insights_data.get('summary'):
+        full_text = rag_insights_data['full_text']
+        if full_text:
+            summary = _extract_summary_from_full_text(full_text)
+            rag_insights_data['summary'] = summary
+
+
+def _extract_summary_from_full_text(full_text):
+    """Extract summary from full text by finding first substantial line."""
+    lines = full_text.split('\n')
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith('#') and len(line) > 20:
+            return line
+    return full_text[:200].strip() + '...' if full_text else ''
 
 
 @app.route('/api/prs/details', methods=['POST'])

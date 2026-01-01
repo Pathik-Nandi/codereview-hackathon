@@ -12,6 +12,10 @@ from models.database import PRComment, PRCommentStatistics, PRAnalysis
 from services.database_service import DatabaseService
 from utils.logger import logger
 
+# Constants
+MSG_STATS_ALREADY_EXIST = 'Statistics already exist'
+MSG_NO_COMMENTS = 'No comments for this'
+
 
 class CommentStatisticsService:
     """Service for generating comment statistics."""
@@ -61,7 +65,7 @@ class CommentStatisticsService:
                 )
                 return {
                     'success': False,
-                    'message': 'Statistics already exist',
+                    'message': MSG_STATS_ALREADY_EXIST,
                     'statistics_id': existing.id
                 }
             
@@ -148,7 +152,7 @@ class CommentStatisticsService:
                 )
                 return {
                     'success': False,
-                    'message': 'Statistics already exist',
+                    'message': MSG_STATS_ALREADY_EXIST,
                     'statistics_id': existing.id
                 }
             
@@ -245,7 +249,7 @@ class CommentStatisticsService:
                 )
                 return {
                     'success': False,
-                    'message': 'Statistics already exist',
+                    'message': MSG_STATS_ALREADY_EXIST,
                     'statistics_id': existing.id
                 }
             
@@ -320,32 +324,13 @@ class CommentStatisticsService:
         success_rate = (successful / total_comments * 100) if total_comments > 0 else 0
         
         # Count by severity
-        severity_map = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
-        for comment in comments:
-            severity = comment.issue_severity
-            if severity and severity.lower() in severity_map:
-                severity_map[severity.lower()] += 1
+        severity_map = self._count_by_severity(comments)
         
         # Count by type
-        type_map = {'security': 0, 'quality': 0, 'complexity': 0, 'coverage': 0}
-        for comment in comments:
-            issue_type = comment.issue_type
-            if issue_type:
-                issue_type_lower = issue_type.lower()
-                if 'security' in issue_type_lower:
-                    type_map['security'] += 1
-                elif 'quality' in issue_type_lower or 'style' in issue_type_lower:
-                    type_map['quality'] += 1
-                elif 'complexity' in issue_type_lower or 'cognitive' in issue_type_lower:
-                    type_map['complexity'] += 1
-                elif 'coverage' in issue_type_lower or 'test' in issue_type_lower:
-                    type_map['coverage'] += 1
+        type_map = self._count_by_issue_type(comments)
         
         # Review type distribution
-        review_types = {'REQUEST_CHANGES': 0, 'COMMENT': 0, 'APPROVE': 0}
-        for comment in comments:
-            if comment.review_event and comment.review_event in review_types:
-                review_types[comment.review_event] += 1
+        review_types = self._count_by_review_type(comments)
         
         return {
             'date': date,
@@ -370,6 +355,40 @@ class CommentStatisticsService:
             'approve_count': review_types['APPROVE'],
             'created_at': datetime.now(timezone.utc)
         }
+    
+    def _count_by_severity(self, comments: List[PRComment]) -> Dict[str, int]:
+        """Count comments by severity level."""
+        severity_map = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
+        for comment in comments:
+            severity = comment.issue_severity
+            if severity and severity.lower() in severity_map:
+                severity_map[severity.lower()] += 1
+        return severity_map
+    
+    def _count_by_issue_type(self, comments: List[PRComment]) -> Dict[str, int]:
+        """Count comments by issue type category."""
+        type_map = {'security': 0, 'quality': 0, 'complexity': 0, 'coverage': 0}
+        for comment in comments:
+            issue_type = comment.issue_type
+            if issue_type:
+                issue_type_lower = issue_type.lower()
+                if 'security' in issue_type_lower:
+                    type_map['security'] += 1
+                elif 'quality' in issue_type_lower or 'style' in issue_type_lower:
+                    type_map['quality'] += 1
+                elif 'complexity' in issue_type_lower or 'cognitive' in issue_type_lower:
+                    type_map['complexity'] += 1
+                elif 'coverage' in issue_type_lower or 'test' in issue_type_lower:
+                    type_map['coverage'] += 1
+        return type_map
+    
+    def _count_by_review_type(self, comments: List[PRComment]) -> Dict[str, int]:
+        """Count comments by review event type."""
+        review_types = {'REQUEST_CHANGES': 0, 'COMMENT': 0, 'APPROVE': 0}
+        for comment in comments:
+            if comment.review_event and comment.review_event in review_types:
+                review_types[comment.review_event] += 1
+        return review_types
     
     def get_statistics(
         self, 

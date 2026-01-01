@@ -101,61 +101,90 @@ class DatabaseService:
         """
         with self.get_session() as session:
             try:
-                # Create PRAnalysis record
-                pr_analysis = PRAnalysis(
+                # Check if PR analysis already exists (upsert logic)
+                existing_pr = session.query(PRAnalysis).filter_by(
                     repository=pr_data.get('repository'),
-                    pr_id=pr_data.get('id'),  # GitHub's unique PR ID
-                    pr_number=pr_data.get('pr_number') or pr_data.get('number'),
-                    pr_title=pr_data.get('title'),
-                    pr_description=pr_data.get('description') or pr_data.get('body'),
-                    pr_url=pr_data.get('url') or pr_data.get('html_url'),
+                    pr_number=pr_data.get('pr_number') or pr_data.get('number')
+                ).first()
+                
+                if existing_pr:
+                    # Update existing record
+                    pr_analysis = existing_pr
+                    pr_analysis.pr_title = pr_data.get('title')
+                    pr_analysis.pr_description = pr_data.get('description') or pr_data.get('body')
+                    pr_analysis.pr_url = pr_data.get('url') or pr_data.get('html_url')
                     
-                    # Author information
-                    author_login=pr_data.get('author', {}).get('login'),
-                    author_email=author_email or pr_data.get('author', {}).get('email'),
-                    author_name=pr_data.get('author', {}).get('name'),
-                    author_id=pr_data.get('author', {}).get('id'),
+                    # Update author info (especially if email was previously missing)
+                    if author_email:
+                        pr_analysis.author_email = author_email
+                    elif pr_data.get('author', {}).get('email'):
+                        pr_analysis.author_email = pr_data.get('author', {}).get('email')
                     
-                    # PR metadata
-                    base_branch=pr_data.get('base_branch'),
-                    head_branch=pr_data.get('head_branch'),
-                    files_changed=pr_data.get('files_changed', 0),
-                    lines_added=pr_data.get('lines_added', 0),
-                    lines_deleted=pr_data.get('lines_deleted', 0),
-                    is_draft=pr_data.get('is_draft', False),
+                    if pr_data.get('author', {}).get('name'):
+                        pr_analysis.author_name = pr_data.get('author', {}).get('name')
                     
-                    # Analysis results
-                    total_issues=analysis_result.get('issues_found', 0),
-                    
-                    # Agent breakdown
-                    static_analysis_issues=analysis_result.get('agent_breakdown', {}).get(
-                        AGENT_STATIC_ANALYSIS, {}).get('issues_count', 0),
-                    security_issues=analysis_result.get('agent_breakdown', {}).get(
-                        AGENT_SECURITY, {}).get('issues_count', 0),
-                    code_quality_issues=analysis_result.get('agent_breakdown', {}).get(
-                        AGENT_CODE_QUALITY, {}).get('issues_count', 0),
-                    context_issues=analysis_result.get('agent_breakdown', {}).get(
-                        'Context Agent', {}).get('issues_count', 0),
-                    coverage_issues=analysis_result.get('agent_breakdown', {}).get(
-                        AGENT_COVERAGE, {}).get('issues_count', 0),
-                    
-                    # Scores (calculated)
-                    overall_quality_score=self._calculate_quality_score(analysis_result),
-                    security_score=self._calculate_security_score(analysis_result),
-                    maintainability_score=self._calculate_maintainability_score(analysis_result),
-                    
-                    # RAG Insights
-                    rag_insights=self._extract_rag_insights(analysis_result),
-                    
-                    # Metadata
-                    analysis_duration_ms=analysis_result.get('analysis_time_ms'),
-                    analyzed_at=datetime.now(timezone.utc),
-                    analyzer_version=analysis_result.get('version', '1.0.0'),
-                    
-                    # PR timestamps
-                    pr_created_at=pr_data.get('created_at'),
-                    pr_updated_at=pr_data.get('updated_at')
-                )
+                    logger.info(
+                        "Updating existing PR analysis",
+                        repository=pr_data.get('repository'),
+                        pr_number=pr_data.get('pr_number'),
+                        author_email=pr_analysis.author_email
+                    )
+                else:
+                    # Create new PRAnalysis record
+                    pr_analysis = PRAnalysis(
+                        repository=pr_data.get('repository'),
+                        pr_id=pr_data.get('id'),  # GitHub's unique PR ID
+                        pr_number=pr_data.get('pr_number') or pr_data.get('number'),
+                        pr_title=pr_data.get('title'),
+                        pr_description=pr_data.get('description') or pr_data.get('body'),
+                        pr_url=pr_data.get('url') or pr_data.get('html_url'),
+                        
+                        # Author information
+                        author_login=pr_data.get('author', {}).get('login'),
+                        author_email=author_email or pr_data.get('author', {}).get('email'),
+                        author_name=pr_data.get('author', {}).get('name'),
+                        author_id=pr_data.get('author', {}).get('id'),
+                        
+                        # PR metadata
+                        base_branch=pr_data.get('base_branch'),
+                        head_branch=pr_data.get('head_branch'),
+                        files_changed=pr_data.get('files_changed', 0),
+                        lines_added=pr_data.get('lines_added', 0),
+                        lines_deleted=pr_data.get('lines_deleted', 0),
+                        is_draft=pr_data.get('is_draft', False),
+                        
+                        # Analysis results
+                        total_issues=analysis_result.get('issues_found', 0),
+                        
+                        # Agent breakdown
+                        static_analysis_issues=analysis_result.get('agent_breakdown', {}).get(
+                            AGENT_STATIC_ANALYSIS, {}).get('issues_count', 0),
+                        security_issues=analysis_result.get('agent_breakdown', {}).get(
+                            AGENT_SECURITY, {}).get('issues_count', 0),
+                        code_quality_issues=analysis_result.get('agent_breakdown', {}).get(
+                            AGENT_CODE_QUALITY, {}).get('issues_count', 0),
+                        context_issues=analysis_result.get('agent_breakdown', {}).get(
+                            'Context Agent', {}).get('issues_count', 0),
+                        coverage_issues=analysis_result.get('agent_breakdown', {}).get(
+                            AGENT_COVERAGE, {}).get('issues_count', 0),
+                        
+                        # Scores (calculated)
+                        overall_quality_score=self._calculate_quality_score(analysis_result),
+                        security_score=self._calculate_security_score(analysis_result),
+                        maintainability_score=self._calculate_maintainability_score(analysis_result),
+                        
+                        # RAG Insights
+                        rag_insights=self._extract_rag_insights(analysis_result),
+                        
+                        # Metadata
+                        analysis_duration_ms=analysis_result.get('analysis_time_ms'),
+                        analyzed_at=datetime.now(timezone.utc),
+                        analyzer_version=analysis_result.get('version', '1.0.0'),
+                        
+                        # PR timestamps
+                        pr_created_at=pr_data.get('created_at'),
+                        pr_updated_at=pr_data.get('updated_at')
+                    )
                 
                 # Calculate severity distribution
                 severity_counts = self._count_severities(analysis_result)
@@ -169,6 +198,11 @@ class DatabaseService:
                 
                 session.add(pr_analysis)
                 session.flush()  # Get the ID
+                
+                # For updates, delete existing issues and metrics before re-adding
+                if existing_pr:
+                    session.query(PRIssue).filter_by(pr_analysis_id=pr_analysis.id).delete()
+                    session.query(PRMetrics).filter_by(pr_analysis_id=pr_analysis.id).delete()
                 
                 # Save individual issues
                 self._save_issues(session, pr_analysis.id, analysis_result)

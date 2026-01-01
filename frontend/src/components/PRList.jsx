@@ -159,7 +159,7 @@ const PRList = ({ onPRClick = () => {} }) => {
           </div>
           <div className="stat-card">
             <span className="stat-value">
-              {prs.filter((pr) => pr.rag_novelty_score > 0.8).length}
+              {prs.filter((pr) => pr.rag_novelty_score >= 0.8).length}
             </span>
             <span className="stat-label">Novel PRs</span>
           </div>

@@ -59,14 +59,20 @@ class GitHubService:
                 'title': pr.title,
                 'body': pr.body or '',
                 'state': pr.state,
+                'draft': pr.draft if hasattr(pr, 'draft') else False,
                 'user': {
-                    'login': pr.user.login
+                    'login': pr.user.login,
+                    'id': pr.user.id,
+                    'email': getattr(pr.user, 'email', None),
+                    'name': getattr(pr.user, 'name', None)
                 },
                 'head': {
-                    'ref': pr.head.ref
+                    'ref': pr.head.ref,
+                    'sha': pr.head.sha  # Required for inline comments
                 },
                 'base': {
-                    'ref': pr.base.ref
+                    'ref': pr.base.ref,
+                    'sha': pr.base.sha
                 },
                 'created_at': pr.created_at.isoformat() if pr.created_at else None,
                 'updated_at': pr.updated_at.isoformat() if pr.updated_at else None

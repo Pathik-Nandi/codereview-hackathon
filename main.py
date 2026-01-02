@@ -574,13 +574,39 @@ def analyze_pr():
         # Persist to database
         persistence_result = _persist_analysis(pr_event, pr_details, result, data, response_data)
         
-        # Post comments to PR if enabled
-        if pr_comment_agent and data.get('post_comments', False):
+        # Post comments to PR if enabled (check config or request parameter)
+        post_comments = data.get('post_comments', config.get('pr_comments.enabled', True))
+        if pr_comment_agent and post_comments:
             try:
                 # Get head commit SHA from PR details
                 head_sha = None
                 if 'head' in pr_details and 'sha' in pr_details['head']:
                     head_sha = pr_details['head']['sha']
+                
+                logger.info(
+                    "Preparing to post PR comments",
+                    repository=repository,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    has_head=('head' in pr_details),
+                    has_sha=('head' in pr_details and 'sha' in pr_details['head'])
+                )
+                
+                # If head_sha is still None, try to get it from the PR event or fetch it
+                if not head_sha:
+                    logger.warning(
+                        "No head SHA found, attempting to fetch from GitHub",
+                        repository=repository,
+                        pr_number=pr_number
+                    )
+                    try:
+                        # Fetch PR details again to get the SHA
+                        pr_info = github_service.get_pr_details(repository, pr_number)
+                        if pr_info and 'head' in pr_info and 'sha' in pr_info['head']:
+                            head_sha = pr_info['head']['sha']
+                            logger.info("Successfully fetched head SHA", head_sha=head_sha)
+                    except Exception as fetch_error:
+                        logger.error("Failed to fetch head SHA", error=str(fetch_error))
                 
                 # Get pr_analysis_id from persistence result
                 pr_analysis_id = persistence_result.get('pr_analysis_id') if persistence_result else None
@@ -610,6 +636,41 @@ def analyze_pr():
                 )
                 # Continue without failing the request
                 response_data['comments_error'] = str(comment_error)
+        
+        # Send Slack Notifications
+        if config.get('output.slack.enabled'):
+            try:
+                slack_message = format_slack_message(pr_event, result)
+                slack_service.send_pr_notification(slack_message)
+                logger.info(
+                    "Sent Slack notification",
+                    repository=repository,
+                    pr_number=pr_number
+                )
+                
+                # Send critical alert if needed
+                if result.critical_count > 0 and config.get('output.slack.mention_on_critical'):
+                    slack_service.send_critical_alert(
+                        pr_event.repository,
+                        pr_event.pr_number,
+                        pr_event.pr_url,
+                        result.critical_count
+                    )
+                    logger.info(
+                        "Sent Slack critical alert",
+                        repository=repository,
+                        pr_number=pr_number,
+                        critical_count=result.critical_count
+                    )
+            except Exception as slack_error:
+                logger.error(
+                    "Failed to send Slack notification",
+                    error=str(slack_error),
+                    repository=repository,
+                    pr_number=pr_number
+                )
+                # Continue without failing the request
+                response_data['slack_error'] = str(slack_error)
         
         return jsonify(response_data), 200
         
@@ -2159,6 +2220,184 @@ def get_pr_comments():
     except Exception as e:
         logger.error("Failed to fetch PR comments", error=str(e), pr_number=pr_number)
         return jsonify({'error': 'Failed to fetch PR comments'}), 500
+
+
+@app.route('/api/slack/notify', methods=['POST'])
+def send_slack_notification():
+    """
+    Send a custom Slack notification.
+    
+    Request Body:
+    {
+        "type": "pr_reviewed" | "comment_posted",
+        "repository": "owner/repo",
+        "pr_number": 123,
+        "pr_url": "https://github.com/...",
+        "pr_title": "Fix bug",
+        "issues_found": 5,
+        "critical_count": 0,
+        "comment": {  // Optional, for comment_posted type
+            "file_path": "src/main.py",
+            "line_number": 45,
+            "severity": "medium",
+            "message": "Comment text..."
+        }
+    }
+    
+    Response:
+    {
+        "success": true,
+        "message": "Notification sent to Slack"
+    }
+    """
+    try:
+        data = request.json
+        
+        if not data:
+            return jsonify({'error': 'Request body is required'}), 400
+        
+        notification_type = data.get('type', 'pr_reviewed')
+        repository = data.get('repository')
+        pr_number = data.get('pr_number')
+        pr_url = data.get('pr_url')
+        
+        if not all([repository, pr_number, pr_url]):
+            return jsonify({'error': 'Missing required fields: repository, pr_number, pr_url'}), 400
+        
+        # Check if Slack is enabled
+        if not config.get('output.slack.enabled'):
+            return jsonify({'error': 'Slack notifications are disabled'}), 400
+        
+        success = False
+        
+        if notification_type == 'pr_reviewed':
+            # PR Review notification
+            pr_title = data.get('pr_title', f'PR #{pr_number}')
+            issues_found = data.get('issues_found', 0)
+            critical_count = data.get('critical_count', 0)
+            
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "✅ PR Review Complete"
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Repository:*\n{repository}"},
+                        {"type": "mrkdwn", "text": f"*PR:*\n#{pr_number}"}
+                    ]
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Title:*\n{pr_title}"},
+                        {"type": "mrkdwn", "text": f"*Issues Found:*\n{issues_found}"}
+                    ]
+                }
+            ]
+            
+            if critical_count > 0:
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"⚠️ *{critical_count} critical issue(s) found!*"
+                    }
+                })
+            
+            blocks.append({
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "View PR"},
+                        "url": pr_url,
+                        "style": "primary" if critical_count == 0 else "danger"
+                    }
+                ]
+            })
+            
+            success = slack_service.send_message(
+                text=f"✅ PR Review Complete: {repository} #{pr_number}",
+                blocks=blocks
+            )
+        
+        elif notification_type == 'comment_posted':
+            # Comment notification
+            comment = data.get('comment', {})
+            file_path = comment.get('file_path', 'Unknown file')
+            line_number = comment.get('line_number', 0)
+            severity = comment.get('severity', 'info')
+            message = comment.get('message', 'No message')
+            
+            severity_emoji = {
+                'critical': '🔴',
+                'high': '🟠',
+                'medium': '🟡',
+                'low': '🔵',
+                'info': 'ℹ️'
+            }.get(severity.lower(), 'ℹ️')
+            
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "💬 New Review Comment"
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Repository:*\n{repository}"},
+                        {"type": "mrkdwn", "text": f"*PR:*\n#{pr_number}"}
+                    ]
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*File:* `{file_path}` (Line {line_number})\n*Severity:* {severity_emoji} {severity.title()}\n\n_{message}_"
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "View Comment"},
+                            "url": pr_url
+                        }
+                    ]
+                }
+            ]
+            
+            success = slack_service.send_message(
+                text=f"💬 New Comment on PR #{pr_number}",
+                blocks=blocks
+            )
+        
+        else:
+            return jsonify({'error': f'Invalid notification type: {notification_type}'}), 400
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': 'Notification sent to Slack'
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to send notification to Slack'
+            }), 500
+    
+    except Exception as e:
+        logger.error("Failed to send Slack notification", error=str(e))
+        return jsonify({'error': 'Failed to send Slack notification'}), 500
 
 
 @app.route('/api/analytics/user', methods=['POST'])

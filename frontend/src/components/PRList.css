@@ -80,38 +80,116 @@
   gap: 20px;
 }
 
-.pr-card {
+/* PR Card Wrapper for expandable functionality */
+.pr-card-wrapper {
   background: white;
   border-radius: 12px;
-  padding: 20px;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  transition: all 0.3s ease;
+  overflow: hidden;
+}
+
+.pr-card-wrapper.expanded {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+}
+
+.pr-card {
+  padding: 20px;
   cursor: pointer;
   transition: all 0.3s ease;
+  border-radius: 12px;
 }
 
 .pr-card:hover {
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
-  transform: translateY(-2px);
+  background: #f8f9fa;
+}
+
+.pr-card-wrapper.expanded .pr-card {
+  background: #f8f9fa;
+  border-bottom: 2px solid #667eea;
 }
 
 .pr-card-header {
   margin-bottom: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.pr-header-left {
+  flex: 1;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.pr-title-group {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pr-expand-icon {
+  color: #667eea;
+  transition: all 0.3s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.pr-expand-icon:hover {
+  color: #5568d3;
+}
+
+.pr-card-wrapper.expanded .pr-expand-icon {
+  color: #5568d3;
+}
+
+.pr-expand-icon svg {
+  transition: transform 0.3s ease;
+}
+
+/* Expanded Details Section */
+.pr-details-expanded {
+  padding: 0;
+  background: #f8f9fa;
+  border-top: 2px solid #e0e0e0;
+  animation: slideDown 0.3s ease-out;
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    max-height: 0;
+  }
+  to {
+    opacity: 1;
+    max-height: 3000px;
+  }
 }
 
 .pr-card-header h3 {
-  margin: 0 0 8px 0;
+  margin: 0;
   color: #333;
   font-size: 18px;
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 .pr-repository {
   display: inline-block;
   padding: 4px 12px;
-  background: #f0f0f0;
+  background: #e8eaf6;
   border-radius: 12px;
   font-size: 12px;
-  color: #666;
-  font-family: monospace;
+  color: #667eea;
+  font-family: 'Courier New', monospace;
+  font-weight: 500;
 }
 
 .pr-card-body {

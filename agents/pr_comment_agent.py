@@ -108,9 +108,17 @@ class PRCommentAgent:
         }
         
         try:
-            # Get commit SHA
+            # Get commit SHA - required for posting inline comments
             if not commit_sha:
-                commit_sha = pr_event.head_sha
+                self.logger.warning(
+                    "No commit SHA provided, cannot post inline comments",
+                    pr_number=pr_event.pr_number,
+                    repository=pr_event.repository
+                )
+                # Post summary only (doesn't require commit SHA)
+                if self.post_summary:
+                    results['summary_posted'] = self._post_summary(pr_event, agent_result)
+                return results
             
             # 1. Post summary comment
             if self.post_summary:
@@ -272,18 +280,31 @@ class PRCommentAgent:
     
     def _build_summary_comment(self, agent_result: AgentResult) -> str:
         """Build the main summary comment."""
-        issues = agent_result.metadata.get('all_issues', [])
+        # Get issues from agent_result.issues (primary) or fallback to metadata
+        issues = agent_result.issues if hasattr(agent_result, 'issues') and agent_result.issues else agent_result.metadata.get('all_issues', [])
         
-        # Count by severity
-        critical = sum(1 for i in issues if i.severity == Severity.CRITICAL)
-        high = sum(1 for i in issues if i.severity == Severity.HIGH)
-        medium = sum(1 for i in issues if i.severity == Severity.MEDIUM)
-        low = sum(1 for i in issues if i.severity == Severity.LOW)
+        self.logger.info(
+            "Building summary comment",
+            issue_count=len(issues),
+            has_issues=bool(issues),
+            agent_name=agent_result.agent_name
+        )
         
-        # Count by type
-        security = sum(1 for i in issues if i.type == IssueType.SECURITY)
-        quality = sum(1 for i in issues if i.type == IssueType.CODE_QUALITY)
-        complexity = sum(1 for i in issues if i.type == IssueType.COMPLEXITY)
+        # Count by severity (use string comparison to avoid enum instance issues)
+        critical = sum(1 for i in issues if str(i.severity.value).lower() == 'critical')
+        high = sum(1 for i in issues if str(i.severity.value).lower() == 'high')
+        medium = sum(1 for i in issues if str(i.severity.value).lower() == 'medium')
+        low = sum(1 for i in issues if str(i.severity.value).lower() == 'low')
+        
+        self.logger.info(
+            "Issue counts by severity",
+            critical=critical, high=high, medium=medium, low=low
+        )
+        
+        # Count by type (use string comparison)
+        security = sum(1 for i in issues if str(i.type.value).lower() == 'security')
+        quality = sum(1 for i in issues if str(i.type.value).lower() == 'quality')
+        complexity = sum(1 for i in issues if str(i.type.value).lower() == 'complexity')
         
         # Build comment
         lines = [
@@ -472,7 +493,7 @@ class PRCommentAgent:
     
     def _build_review_body(self, agent_result: AgentResult, comment_count: int) -> str:
         """Build the main review body text."""
-        issues = agent_result.metadata.get('all_issues', [])
+        issues = agent_result.issues if hasattr(agent_result, 'issues') and agent_result.issues else []
         critical = sum(1 for i in issues if i.severity == Severity.CRITICAL)
         high = sum(1 for i in issues if i.severity == Severity.HIGH)
         
@@ -501,7 +522,7 @@ class PRCommentAgent:
             'REQUEST_CHANGES' if critical issues found
             'COMMENT' otherwise
         """
-        issues = agent_result.metadata.get('all_issues', [])
+        issues = agent_result.issues if hasattr(agent_result, 'issues') and agent_result.issues else []
         critical = sum(1 for i in issues if i.severity == Severity.CRITICAL)
         
         if critical > 0:

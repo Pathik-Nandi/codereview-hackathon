@@ -189,6 +189,46 @@ class PRService {
       return { success: false, error: error.message };
     }
   }
+
+  /**
+   * Get comments for a specific PR
+   * @param {boolean} includeCode - Whether to fetch GitHub code context (default: false for performance)
+   */
+  async getPRComments(repository, prNumber, includeCode = false) {
+    try {
+      const token = this.getToken();
+      const response = await fetch(`${API_BASE_URL}/prs/comments`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          repository,
+          pr_number: prNumber,
+          include_code: includeCode,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to fetch PR comments');
+      }
+
+      return { success: true, data };
+    } catch (error) {
+      console.error('getPRComments error:', error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Get comments with code context for a specific file
+   */
+  async getPRCommentsWithCode(repository, prNumber) {
+    return this.getPRComments(repository, prNumber, true);
+  }
 }
 
 export default new PRService();

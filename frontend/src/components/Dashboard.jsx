@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
 import PRList from './PRList';
-import PRDetails from './PRDetails';
 import Analytics from './Analytics';
 import './Auth.css';
 import './Dashboard.css';
@@ -9,21 +8,9 @@ import './Dashboard.css';
 const Dashboard = () => {
   const { user, logout } = useAuth();
   const [activeTab, setActiveTab] = useState('overview');
-  const [selectedPR, setSelectedPR] = useState(null);
-  const [showPRDetails, setShowPRDetails] = useState(false);
 
   const handleLogout = async () => {
     await logout();
-  };
-
-  const handlePRClick = (pr) => {
-    setSelectedPR(pr);
-    setShowPRDetails(true);
-  };
-
-  const handleClosePRDetails = () => {
-    setShowPRDetails(false);
-    setSelectedPR(null);
   };
 
   return (
@@ -88,17 +75,13 @@ const Dashboard = () => {
         )}
 
         {activeTab === 'prs' && (
-          <PRList userEmail={user?.email} onPRClick={handlePRClick} />
+          <PRList userEmail={user?.email} />
         )}
 
         {activeTab === 'analytics' && (
           <Analytics userEmail={user?.email} />
         )}
       </div>
-
-      {showPRDetails && selectedPR && (
-        <PRDetails pr={selectedPR} onClose={handleClosePRDetails} />
-      )}
     </div>
   );
 };

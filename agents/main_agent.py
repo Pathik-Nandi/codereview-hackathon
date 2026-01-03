@@ -1,5 +1,6 @@
 """Main orchestrator agent that calls all other agents."""
 from typing import List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from models.pr_event import PREvent
 from models.analysis_result import AgentResult, Issue
 from agents.base_agent import BaseAgent
@@ -84,6 +85,7 @@ class MainAgent(BaseAgent):
     def _analyze_impl(self, pr_event: PREvent) -> List[Issue]:
         """
         Run all agents and aggregate their results.
+        Uses parallel execution for independent agents to improve performance.
         
         Args:
             pr_event: PR event to analyze
@@ -101,38 +103,61 @@ class MainAgent(BaseAgent):
             file_count=len(pr_event.files)
         )
         
-        # Run each agent sequentially
-        for agent in self.agents:
-            try:
-                self.logger.info(f"Running {agent.name}...")
-                
-                # Analyze with this agent
-                agent_result = agent.analyze(pr_event)
-                
-                # Store results (include both metrics and metadata for database persistence)
-                # metrics: standard agent metrics, metadata: custom agent data (e.g., RAG insights)
-                agent_results[agent.name] = {
-                    'issues_count': len(agent_result.issues),
-                    'issues': agent_result.issues,
-                    'metrics': agent_result.metrics,  # Standard metrics
-                    'metadata': agent_result.metadata  # Custom metadata (e.g., RAG data)
+        # Separate RAG agent from others (RAG should run last)
+        rag_agents = [a for a in self.agents if isinstance(a, RAGEnhancedAgent)]
+        other_agents = [a for a in self.agents if not isinstance(a, RAGEnhancedAgent)]
+        
+        # Run non-RAG agents in parallel for faster execution
+        if other_agents:
+            with ThreadPoolExecutor(max_workers=min(len(other_agents), 5)) as executor:
+                # Submit all agent tasks
+                future_to_agent = {
+                    executor.submit(self._run_single_agent, agent, pr_event): agent
+                    for agent in other_agents
                 }
                 
-                # Add to aggregated results
-                all_issues.extend(agent_result.issues)
+                # Collect results as they complete
+                for future in as_completed(future_to_agent):
+                    agent = future_to_agent[future]
+                    try:
+                        agent_result, agent_name = future.result()
+                        agent_results[agent_name] = agent_result
+                        all_issues.extend(agent_result['issues'])
+                        
+                        self.logger.info(
+                            f"{agent_name} completed",
+                            issues_found=agent_result['issues_count']
+                        )
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error in {agent.name}",
+                            error=str(e),
+                            exc_info=True
+                        )
+                        agent_results[agent.name] = {
+                            'error': str(e),
+                            'issues_count': 0,
+                            'issues': []
+                        }
+        
+        # Run RAG agents last (they may use context from other agents)
+        for agent in rag_agents:
+            try:
+                self.logger.info(f"Running {agent.name}...")
+                agent_result, agent_name = self._run_single_agent(agent, pr_event)
+                agent_results[agent_name] = agent_result
+                all_issues.extend(agent_result['issues'])
                 
                 self.logger.info(
-                    f"{agent.name} completed",
-                    issues_found=len(agent_result.issues)
+                    f"{agent_name} completed",
+                    issues_found=agent_result['issues_count']
                 )
-                
             except Exception as e:
                 self.logger.error(
                     f"Error in {agent.name}",
                     error=str(e),
                     exc_info=True
                 )
-                # Continue with other agents even if one fails
                 agent_results[agent.name] = {
                     'error': str(e),
                     'issues_count': 0,
@@ -150,6 +175,29 @@ class MainAgent(BaseAgent):
         self._agent_breakdown = agent_results
         
         return all_issues
+    
+    def _run_single_agent(self, agent: BaseAgent, pr_event: PREvent) -> tuple:
+        """
+        Run a single agent and return its results.
+        
+        Args:
+            agent: Agent to run
+            pr_event: PR event to analyze
+            
+        Returns:
+            Tuple of (agent_result_dict, agent_name)
+        """
+        agent_result = agent.analyze(pr_event)
+        
+        # Store results (include both metrics and metadata for database persistence)
+        result_dict = {
+            'issues_count': len(agent_result.issues),
+            'issues': agent_result.issues,
+            'metrics': agent_result.metrics,  # Standard metrics
+            'metadata': agent_result.metadata  # Custom metadata (e.g., RAG data)
+        }
+        
+        return result_dict, agent.name
     
     def get_agent_breakdown(self) -> dict:
         """Get breakdown of issues by agent."""

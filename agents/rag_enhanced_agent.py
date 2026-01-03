@@ -271,9 +271,8 @@ class RAGEnhancedAgent(BaseAgent):
             # Generate embedding for query
             query_embedding = self.embedding_model.encode(query_text).tolist()
             
-            # Determine max results based on what's available in vector DB
-            # Query with a reasonable upper limit, then filter by similarity threshold
-            max_results = min(20, self.vector_db.count() if hasattr(self.vector_db, 'count') else 20)
+            # Determine max results - limit to 5 for performance
+            max_results = min(5, self.vector_db.count() if hasattr(self.vector_db, 'count') else 5)
             
             # Search for similar PRs
             results = self.vector_db.query(
@@ -283,7 +282,7 @@ class RAGEnhancedAgent(BaseAgent):
             )
             
             # Process results and filter by similarity threshold
-            similarity_threshold = 0.3  # Only include PRs with similarity > 30%
+            similarity_threshold = 0.4  # Stricter threshold (40%) for better matches
             
             if results and results['documents']:
                 for i, doc in enumerate(results['documents'][0]):
@@ -340,17 +339,25 @@ class RAGEnhancedAgent(BaseAgent):
             
             # Generate insights using AI
             if self.ai_provider == 'gemini':
-                response = self.model.generate_content(prompt)
+                response = self.model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.5,  # Reduced from 0.7 for faster, more focused responses
+                        max_output_tokens=500  # Reduced from default for faster generation
+                    ),
+                    request_options={'timeout': 10}  # 10 second timeout
+                )
                 insights_text = response.text
             else:  # OpenAI
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
-                        {"role": "system", "content": "You are an expert code reviewer with access to historical PR data."},
+                        {"role": "system", "content": "You are a concise code review expert. Provide brief, actionable insights."},
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=0.7,
-                    max_tokens=800
+                    temperature=0.5,  # Reduced from 0.7
+                    max_tokens=500,  # Reduced from 800
+                    timeout=10  # 10 second timeout
                 )
                 insights_text = response.choices[0].message.content
             
@@ -376,42 +383,30 @@ class RAGEnhancedAgent(BaseAgent):
         pr_event: PREvent,
         relevant_context: Dict[str, Any]
     ) -> str:
-        """Build prompt with retrieved context."""
+        """Build concise prompt with retrieved context."""
         
-        # Format similar PRs context
+        # Format similar PRs context - limit to top 2 for speed
         similar_prs_text = ""
         if relevant_context['similar_prs']:
-            similar_prs_text = "\n\n**Similar PRs from history:**\n"
-            for pr in relevant_context['similar_prs'][:3]:  # Top 3
-                similar_prs_text += f"- PR #{pr['pr_number']}: {pr['pr_title']}\n"
-                similar_prs_text += f"  Issues found: {pr['issues_found']}\n"
-                similar_prs_text += f"  Similarity: {pr['similarity_score']:.2f}\n"
+            similar_prs_text = "\n**Similar PRs:**\n"
+            for pr in relevant_context['similar_prs'][:2]:  # Top 2 only
+                similar_prs_text += f"- PR #{pr['pr_number']}: {pr['pr_title']} ({pr['issues_found']} issues)\n"
         
-        # Safe access to PR description
-        pr_description = pr_event.pr_description[:500] if pr_event.pr_description else "No description provided"
+        # Limit description to 300 chars
+        pr_description = pr_event.pr_description[:300] if pr_event.pr_description else "No description"
         
-        prompt = f"""
-You are an expert code reviewer analyzing a pull request with access to historical data.
+        prompt = f"""Analyze this PR using historical data:
 
-**Current PR:**
-- Title: {pr_event.pr_title}
+**Current PR:** {pr_event.pr_title}
 - Description: {pr_description}
-- Files changed: {len(pr_event.files)}
-- Branch: {pr_event.head_branch} → {pr_event.base_branch}
-
+- Files: {len(pr_event.files)} | Branch: {pr_event.head_branch} → {pr_event.base_branch}
 {similar_prs_text}
 
-**Based on the current PR and similar historical PRs, provide:**
-
-1. **Lessons from History**: What issues were common in similar PRs? (2-3 points)
-
-2. **Recommendations**: Based on past patterns, what should reviewers focus on? (2-3 points)
-
-3. **Potential Pitfalls**: What mistakes were made in similar PRs that should be avoided? (2-3 points)
-
-4. **Best Practices**: What patterns from successful PRs should be followed? (2-3 points)
-
-Keep responses concise and actionable.
+Provide brief, actionable insights (1-2 points each):
+1. **Lessons**: Common issues from similar PRs
+2. **Recommendations**: Key review focus areas  
+3. **Pitfalls**: Mistakes to avoid
+4. **Best Practices**: Patterns to follow
 """
         return prompt
     

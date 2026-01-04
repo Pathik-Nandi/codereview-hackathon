@@ -30,6 +30,9 @@ ERROR_MISSING_REPO_PR = 'Missing required fields: repository and pr_number'
 ERROR_AUTH_SERVICE_UNAVAILABLE = 'Authentication service not available'
 ERROR_EMAIL_REQUIRED = 'Email is required in request body'
 
+# Config keys
+CONFIG_OUTPUT_SLACK_ENABLED = 'output.slack.enabled'
+
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})  # Enable CORS for all API routes
 
@@ -526,6 +529,110 @@ def _persist_analysis(pr_event, pr_details, result, data, response_data):
     return None
 
 
+def _get_head_sha_from_pr_details(pr_details: dict, repository: str, pr_number: int) -> Optional[str]:
+    """Extract head SHA from PR details or fetch if missing."""
+    # Try to get from pr_details
+    if 'head' in pr_details and 'sha' in pr_details['head']:
+        return pr_details['head']['sha']
+    
+    # If not found, try to fetch from GitHub
+    logger.warning(
+        "No head SHA found, attempting to fetch from GitHub",
+        repository=repository,
+        pr_number=pr_number
+    )
+    try:
+        pr_info = github_service.get_pr_details(repository, pr_number)
+        if pr_info and 'head' in pr_info and 'sha' in pr_info['head']:
+            head_sha = pr_info['head']['sha']
+            logger.info("Successfully fetched head SHA", head_sha=head_sha)
+            return head_sha
+    except Exception as fetch_error:
+        logger.error("Failed to fetch head SHA", error=str(fetch_error))
+    
+    return None
+
+
+def _handle_pr_comments_tracking(pr_event, result, pr_details, persistence_result, response_data, repository, pr_number):
+    """Handle tracking comments in database (update if exists, insert if new)."""
+    try:
+        head_sha = _get_head_sha_from_pr_details(pr_details, repository, pr_number)
+        
+        logger.info(
+            "Preparing to track PR comments in database",
+            repository=repository,
+            pr_number=pr_number,
+            head_sha=head_sha
+        )
+        
+        # Get pr_analysis_id from persistence result
+        pr_analysis_id = persistence_result.get('pr_analysis_id') if persistence_result else None
+        
+        # Track comments in database (post_comments=False means don't post to GitHub)
+        comment_result = pr_comment_agent.post_analysis_comments(
+            pr_event=pr_event,
+            agent_result=result,
+            commit_sha=head_sha,
+            pr_analysis_id=pr_analysis_id
+        )
+        
+        response_data['comments_tracked'] = comment_result
+        logger.info(
+            "Tracked PR comments in database",
+            repository=repository,
+            pr_number=pr_number,
+            summary_tracked=comment_result.get('summary_posted'),  # Note: 'posted' flag still used internally
+            inline_count=comment_result.get('inline_comments_posted')
+        )
+        
+    except Exception as comment_error:
+        logger.error(
+            "Failed to track PR comments",
+            error=str(comment_error),
+            repository=repository,
+            pr_number=pr_number
+        )
+        response_data['comments_error'] = str(comment_error)
+
+
+def _handle_slack_notifications(pr_event, result, repository, pr_number, response_data):
+    """Handle sending Slack notifications."""
+    if not config.get(CONFIG_OUTPUT_SLACK_ENABLED):
+        return
+    
+    try:
+        slack_message = format_slack_message(pr_event, result)
+        slack_service.send_pr_notification(slack_message)
+        logger.info(
+            "Sent Slack notification",
+            repository=repository,
+            pr_number=pr_number
+        )
+        
+        # Send critical alert if needed
+        if result.critical_count > 0 and config.get('output.slack.mention_on_critical'):
+            slack_service.send_critical_alert(
+                pr_event.repository,
+                pr_event.pr_number,
+                pr_event.pr_url,
+                result.critical_count
+            )
+            logger.info(
+                "Sent Slack critical alert",
+                repository=repository,
+                pr_number=pr_number,
+                critical_count=result.critical_count
+            )
+    except Exception as slack_error:
+        logger.error(
+            "Failed to send Slack notification",
+            error=str(slack_error),
+            repository=repository,
+            pr_number=pr_number
+        )
+        response_data['slack_error'] = str(slack_error)
+
+
 @app.route('/api/analyze', methods=['POST'])
 def analyze_pr():
     """
@@ -535,10 +642,19 @@ def analyze_pr():
     {
         "repository": "owner/repo",
         "pr_number": 123,
-        "agent_type": "security"  // optional: static_analysis, security, code_quality, context
+        "agent_type": "security",  // optional: static_analysis, security, code_quality, context
+        "author_email": "user@example.com"  // optional: override author email for tracking
     }
     
     The system will automatically fetch PR details from GitHub.
+    If author_email is provided, it will be used for tracking the PR.
+    Otherwise, the system will try to get email from GitHub or git commits.
+    
+    The system will:
+    - Always analyze the PR
+    - Always save comments to database
+    - Update existing comments if they already exist in database
+    - Never post comments to GitHub (comments stored locally only)
     """
     try:
         data = request.json
@@ -565,7 +681,7 @@ def analyze_pr():
         
         pr_event, pr_details = pr_data_tuple
         
-        # Dispatch to agent
+        # Dispatch to agent (always analyze)
         result = dispatcher.dispatch(pr_event, agent_type)
         
         # Build response
@@ -574,103 +690,13 @@ def analyze_pr():
         # Persist to database
         persistence_result = _persist_analysis(pr_event, pr_details, result, data, response_data)
         
-        # Post comments to PR if enabled (check config or request parameter)
-        post_comments = data.get('post_comments', config.get('pr_comments.enabled', True))
-        if pr_comment_agent and post_comments:
-            try:
-                # Get head commit SHA from PR details
-                head_sha = None
-                if 'head' in pr_details and 'sha' in pr_details['head']:
-                    head_sha = pr_details['head']['sha']
-                
-                logger.info(
-                    "Preparing to post PR comments",
-                    repository=repository,
-                    pr_number=pr_number,
-                    head_sha=head_sha,
-                    has_head=('head' in pr_details),
-                    has_sha=('head' in pr_details and 'sha' in pr_details['head'])
-                )
-                
-                # If head_sha is still None, try to get it from the PR event or fetch it
-                if not head_sha:
-                    logger.warning(
-                        "No head SHA found, attempting to fetch from GitHub",
-                        repository=repository,
-                        pr_number=pr_number
-                    )
-                    try:
-                        # Fetch PR details again to get the SHA
-                        pr_info = github_service.get_pr_details(repository, pr_number)
-                        if pr_info and 'head' in pr_info and 'sha' in pr_info['head']:
-                            head_sha = pr_info['head']['sha']
-                            logger.info("Successfully fetched head SHA", head_sha=head_sha)
-                    except Exception as fetch_error:
-                        logger.error("Failed to fetch head SHA", error=str(fetch_error))
-                
-                # Get pr_analysis_id from persistence result
-                pr_analysis_id = persistence_result.get('pr_analysis_id') if persistence_result else None
-                
-                comment_result = pr_comment_agent.post_analysis_comments(
-                    pr_event=pr_event,
-                    agent_result=result,
-                    commit_sha=head_sha,
-                    pr_analysis_id=pr_analysis_id
-                )
-                
-                response_data['comments_posted'] = comment_result
-                logger.info(
-                    "Posted PR comments",
-                    repository=repository,
-                    pr_number=pr_number,
-                    summary_posted=comment_result.get('summary_posted'),
-                    inline_count=comment_result.get('inline_comments_posted')
-                )
-                
-            except Exception as comment_error:
-                logger.error(
-                    "Failed to post PR comments",
-                    error=str(comment_error),
-                    repository=repository,
-                    pr_number=pr_number
-                )
-                # Continue without failing the request
-                response_data['comments_error'] = str(comment_error)
+        # Always track comments in database (update if exists, insert if new)
+        if pr_comment_agent:
+            _handle_pr_comments_tracking(pr_event, result, pr_details, persistence_result, 
+                                       response_data, repository, pr_number)
         
         # Send Slack Notifications
-        if config.get('output.slack.enabled'):
-            try:
-                slack_message = format_slack_message(pr_event, result)
-                slack_service.send_pr_notification(slack_message)
-                logger.info(
-                    "Sent Slack notification",
-                    repository=repository,
-                    pr_number=pr_number
-                )
-                
-                # Send critical alert if needed
-                if result.critical_count > 0 and config.get('output.slack.mention_on_critical'):
-                    slack_service.send_critical_alert(
-                        pr_event.repository,
-                        pr_event.pr_number,
-                        pr_event.pr_url,
-                        result.critical_count
-                    )
-                    logger.info(
-                        "Sent Slack critical alert",
-                        repository=repository,
-                        pr_number=pr_number,
-                        critical_count=result.critical_count
-                    )
-            except Exception as slack_error:
-                logger.error(
-                    "Failed to send Slack notification",
-                    error=str(slack_error),
-                    repository=repository,
-                    pr_number=pr_number
-                )
-                # Continue without failing the request
-                response_data['slack_error'] = str(slack_error)
+        _handle_slack_notifications(pr_event, result, repository, pr_number, response_data)
         
         return jsonify(response_data), 200
         
@@ -808,7 +834,7 @@ def send_feedback(pr_event: PREvent, result):
                 )
     
     # Slack Notifications
-    if config.get('output.slack.enabled'):
+    if config.get(CONFIG_OUTPUT_SLACK_ENABLED):
         slack_message = format_slack_message(pr_event, result)
         slack_service.send_pr_notification(slack_message)
         
@@ -2067,6 +2093,83 @@ def _extract_code_context(file_content: dict, line_number: int, context_lines: i
     }
 
 
+def _find_pr_by_number(session, pr_number: int, repository: Optional[str]):
+    """Find PR analysis by PR number and optionally repository."""
+    from models.database import PRAnalysis
+    
+    query = session.query(PRAnalysis).filter_by(pr_number=pr_number)
+    
+    if repository:
+        query = query.filter_by(repository=repository)
+    
+    return query.first()
+
+
+def _get_pr_comments_from_db(session, pr_analysis_id: int):
+    """Get all comments for a PR analysis from database."""
+    from models.database import PRComment
+    
+    return session.query(PRComment).filter_by(
+        pr_analysis_id=pr_analysis_id
+    ).order_by(PRComment.file_path, PRComment.line_number).all()
+
+
+def _format_comment_basic_info(comment) -> dict:
+    """Format basic comment information."""
+    return {
+        'id': comment.id,
+        'comment_type': comment.comment_type,
+        'file_path': comment.file_path,
+        'line_number': comment.line_number,
+        'commit_sha': comment.commit_sha,
+        'comment_body': comment.comment_body,
+        'comment_preview': comment.comment_preview,
+        'issue_severity': comment.issue_severity,
+        'issue_type': comment.issue_type,
+        'posted_successfully': comment.posted_successfully,
+        'review_event': comment.review_event,
+        'github_url': comment.github_url,
+        'reactions_count': comment.reactions_count,
+        'replies_count': comment.replies_count,
+        'was_edited': comment.was_edited,
+        'was_resolved': comment.was_resolved,
+        'resolved_at': comment.resolved_at.isoformat() if comment.resolved_at else None,
+        'posted_at': comment.posted_at.isoformat() if comment.posted_at else None,
+        'github_comment_id': comment.github_comment_id,
+        'github_review_id': comment.github_review_id
+    }
+
+
+def _add_code_context_if_requested(comment_dict: dict, comment, pr_repository: str, 
+                                    include_code: bool, file_cache: dict):
+    """Add code context to comment if requested and available."""
+    if not (include_code and github_service and comment.file_path and 
+            comment.line_number and comment.commit_sha):
+        return
+    
+    # Create cache key for this file at this commit
+    cache_key = f"{comment.commit_sha}:{comment.file_path}"
+    
+    # Get file content from cache or fetch it
+    if cache_key not in file_cache:
+        file_cache[cache_key] = github_service.get_file_content_at_commit(
+            repository=pr_repository,
+            file_path=comment.file_path,
+            commit_sha=comment.commit_sha
+        )
+    
+    # Extract lines around the comment line from cached content
+    file_content = file_cache[cache_key]
+    if file_content:
+        code_context = _extract_code_context(
+            file_content, 
+            comment.line_number, 
+            context_lines=3
+        )
+        if code_context:
+            comment_dict['code_context'] = code_context
+
+
 @app.route('/api/prs/comments', methods=['POST'])
 def get_pr_comments():
     """
@@ -2126,17 +2229,11 @@ def get_pr_comments():
         
         pr_number = data.get('pr_number')
         repository = data.get('repository')
+        include_code = data.get('include_code', False)
         
         # Get PR and its comments from database
         with db_service.get_session() as session:
-            from models.database import PRAnalysis, PRComment
-            
-            query = session.query(PRAnalysis).filter_by(pr_number=pr_number)
-            
-            if repository:
-                query = query.filter_by(repository=repository)
-            
-            pr = query.first()
+            pr = _find_pr_by_number(session, pr_number, repository)
             
             if not pr:
                 return jsonify({
@@ -2146,67 +2243,16 @@ def get_pr_comments():
                 }), 404
             
             # Get comments for this PR
-            comments = session.query(PRComment).filter_by(
-                pr_analysis_id=pr.id
-            ).order_by(PRComment.file_path, PRComment.line_number).all()
-            
-            # Check if code context is requested (optional for performance)
-            include_code = data.get('include_code', False)
+            comments = _get_pr_comments_from_db(session, pr.id)
             
             # Format comments with optional code context
             comments_list = []
-            
-            # Cache for file contents to avoid redundant GitHub API calls
-            file_cache = {}
+            file_cache = {}  # Cache for file contents to avoid redundant GitHub API calls
             
             for comment in comments:
-                comment_dict = {
-                    'id': comment.id,
-                    'comment_type': comment.comment_type,
-                    'file_path': comment.file_path,
-                    'line_number': comment.line_number,
-                    'commit_sha': comment.commit_sha,
-                    'comment_body': comment.comment_body,
-                    'comment_preview': comment.comment_preview,
-                    'issue_severity': comment.issue_severity,
-                    'issue_type': comment.issue_type,
-                    'posted_successfully': comment.posted_successfully,
-                    'review_event': comment.review_event,
-                    'github_url': comment.github_url,
-                    'reactions_count': comment.reactions_count,
-                    'replies_count': comment.replies_count,
-                    'was_edited': comment.was_edited,
-                    'was_resolved': comment.was_resolved,
-                    'resolved_at': comment.resolved_at.isoformat() if comment.resolved_at else None,
-                    'posted_at': comment.posted_at.isoformat() if comment.posted_at else None,
-                    'github_comment_id': comment.github_comment_id,
-                    'github_review_id': comment.github_review_id
-                }
-                
-                # Fetch code context from GitHub if requested and we have the necessary info
-                if include_code and github_service and comment.file_path and comment.line_number and comment.commit_sha:
-                    # Create cache key for this file at this commit
-                    cache_key = f"{comment.commit_sha}:{comment.file_path}"
-                    
-                    # Get file content from cache or fetch it
-                    if cache_key not in file_cache:
-                        file_cache[cache_key] = github_service.get_file_content_at_commit(
-                            repository=pr.repository,
-                            file_path=comment.file_path,
-                            commit_sha=comment.commit_sha
-                        )
-                    
-                    # Extract lines around the comment line from cached content
-                    file_content = file_cache[cache_key]
-                    if file_content:
-                        code_context = _extract_code_context(
-                            file_content, 
-                            comment.line_number, 
-                            context_lines=3
-                        )
-                        if code_context:
-                            comment_dict['code_context'] = code_context
-                
+                comment_dict = _format_comment_basic_info(comment)
+                _add_code_context_if_requested(comment_dict, comment, pr.repository, 
+                                               include_code, file_cache)
                 comments_list.append(comment_dict)
             
             return jsonify({
@@ -2265,7 +2311,7 @@ def send_slack_notification():
             return jsonify({'error': 'Missing required fields: repository, pr_number, pr_url'}), 400
         
         # Check if Slack is enabled
-        if not config.get('output.slack.enabled'):
+        if not config.get(CONFIG_OUTPUT_SLACK_ENABLED):
             return jsonify({'error': 'Slack notifications are disabled'}), 400
         
         success = False

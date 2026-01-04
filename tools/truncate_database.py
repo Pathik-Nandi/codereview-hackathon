@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 # Add project root to path
-project_root = Path(__file__).parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from services.database_service import DatabaseService
@@ -24,10 +24,17 @@ def truncate_all_tables():
     tables = [
         'pr_comments',
         'pr_comment_statistics',
+        'rag_similar_pr_references',
+        'rag_recommendations',
+        'rag_learned_patterns',
         'rag_insights',
         'pr_issues',
         'pr_metrics',
-        'pr_analysis'
+        'pr_analysis',
+        'best_practices',
+        'trend_analysis',
+        'user_analytics',
+        'user_statistics'
     ]
     
     print(f"\n⚠️  WARNING: About to truncate {len(tables)} tables:")

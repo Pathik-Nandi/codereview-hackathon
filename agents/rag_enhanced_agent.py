@@ -271,9 +271,8 @@ class RAGEnhancedAgent(BaseAgent):
             # Generate embedding for query
             query_embedding = self.embedding_model.encode(query_text).tolist()
             
-            # Determine max results based on what's available in vector DB
-            # Query with a reasonable upper limit, then filter by similarity threshold
-            max_results = min(20, self.vector_db.count() if hasattr(self.vector_db, 'count') else 20)
+            # Determine max results - limit to 5 for performance
+            max_results = min(5, self.vector_db.count() if hasattr(self.vector_db, 'count') else 5)
             
             # Search for similar PRs
             results = self.vector_db.query(
@@ -283,26 +282,33 @@ class RAGEnhancedAgent(BaseAgent):
             )
             
             # Process results and filter by similarity threshold
-            similarity_threshold = 0.3  # Only include PRs with similarity > 30%
+            # ChromaDB returns squared L2 distance - smaller is better
+            # For normalized embeddings, L2 distance ≈ sqrt(2 * (1 - cosine_similarity))
+            # So distance of 0.8 ≈ cosine similarity of 0.68
+            max_distance = 1.2  # Corresponds to ~0.28 cosine similarity threshold
             
             if results and results['documents']:
                 for i, doc in enumerate(results['documents'][0]):
                     metadata = results['metadatas'][0][i]
                     distance = results['distances'][0][i]
-                    similarity = 1 - distance  # Convert distance to similarity
                     
-                    # Only include PRs that meet similarity threshold
-                    if similarity >= similarity_threshold:
+                    # Convert L2 distance to approximate cosine similarity
+                    # For normalized vectors: cosine_sim ≈ 1 - (L2_distance² / 2)
+                    similarity = max(0, 1 - (distance / 2))
+                    
+                    # Only include PRs that are reasonably similar (distance < 1.2)
+                    if distance < max_distance:
                         context['similar_prs'].append({
                             'pr_number': metadata.get('pr_number'),
                             'pr_title': metadata.get('pr_title'),
                             'issues_found': metadata.get('issues_found'),
                             'similarity_score': similarity,
                             'similarity': similarity,  # For compatibility
-                            'summary': doc[:200]  # First 200 chars
+                            'summary': doc[:200],  # First 200 chars
+                            'distance': distance  # Include raw distance for debugging
                         })
             
-            logger.info(f"Retrieved {len(context['similar_prs'])} similar PRs (threshold: {similarity_threshold})")
+            logger.info(f"Retrieved {len(context['similar_prs'])} similar PRs (max_distance: {max_distance})")
             
         except Exception as e:
             logger.error(f"Context retrieval failed: {e}")
@@ -340,17 +346,25 @@ class RAGEnhancedAgent(BaseAgent):
             
             # Generate insights using AI
             if self.ai_provider == 'gemini':
-                response = self.model.generate_content(prompt)
+                response = self.model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.5,  # Reduced from 0.7 for faster, more focused responses
+                        max_output_tokens=500  # Reduced from default for faster generation
+                    ),
+                    request_options={'timeout': 10}  # 10 second timeout
+                )
                 insights_text = response.text
             else:  # OpenAI
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
-                        {"role": "system", "content": "You are an expert code reviewer with access to historical PR data."},
+                        {"role": "system", "content": "You are a concise code review expert. Provide brief, actionable insights."},
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=0.7,
-                    max_tokens=800
+                    temperature=0.5,  # Reduced from 0.7
+                    max_tokens=500,  # Reduced from 800
+                    timeout=10  # 10 second timeout
                 )
                 insights_text = response.choices[0].message.content
             
@@ -376,42 +390,30 @@ class RAGEnhancedAgent(BaseAgent):
         pr_event: PREvent,
         relevant_context: Dict[str, Any]
     ) -> str:
-        """Build prompt with retrieved context."""
+        """Build concise prompt with retrieved context."""
         
-        # Format similar PRs context
+        # Format similar PRs context - limit to top 2 for speed
         similar_prs_text = ""
         if relevant_context['similar_prs']:
-            similar_prs_text = "\n\n**Similar PRs from history:**\n"
-            for pr in relevant_context['similar_prs'][:3]:  # Top 3
-                similar_prs_text += f"- PR #{pr['pr_number']}: {pr['pr_title']}\n"
-                similar_prs_text += f"  Issues found: {pr['issues_found']}\n"
-                similar_prs_text += f"  Similarity: {pr['similarity_score']:.2f}\n"
+            similar_prs_text = "\n**Similar PRs:**\n"
+            for pr in relevant_context['similar_prs'][:2]:  # Top 2 only
+                similar_prs_text += f"- PR #{pr['pr_number']}: {pr['pr_title']} ({pr['issues_found']} issues)\n"
         
-        # Safe access to PR description
-        pr_description = pr_event.pr_description[:500] if pr_event.pr_description else "No description provided"
+        # Limit description to 300 chars
+        pr_description = pr_event.pr_description[:300] if pr_event.pr_description else "No description"
         
-        prompt = f"""
-You are an expert code reviewer analyzing a pull request with access to historical data.
+        prompt = f"""Analyze this PR using historical data:
 
-**Current PR:**
-- Title: {pr_event.pr_title}
+**Current PR:** {pr_event.pr_title}
 - Description: {pr_description}
-- Files changed: {len(pr_event.files)}
-- Branch: {pr_event.head_branch} → {pr_event.base_branch}
-
+- Files: {len(pr_event.files)} | Branch: {pr_event.head_branch} → {pr_event.base_branch}
 {similar_prs_text}
 
-**Based on the current PR and similar historical PRs, provide:**
-
-1. **Lessons from History**: What issues were common in similar PRs? (2-3 points)
-
-2. **Recommendations**: Based on past patterns, what should reviewers focus on? (2-3 points)
-
-3. **Potential Pitfalls**: What mistakes were made in similar PRs that should be avoided? (2-3 points)
-
-4. **Best Practices**: What patterns from successful PRs should be followed? (2-3 points)
-
-Keep responses concise and actionable.
+Provide brief, actionable insights (1-2 points each):
+1. **Lessons**: Common issues from similar PRs
+2. **Recommendations**: Key review focus areas  
+3. **Pitfalls**: Mistakes to avoid
+4. **Best Practices**: Patterns to follow
 """
         return prompt
     
@@ -439,10 +441,10 @@ Keep responses concise and actionable.
         
         # Map search terms to more flexible patterns
         search_patterns = {
-            'recommendations': ['recommendation', 'suggest', 'advice'],
-            'lessons': ['lesson', 'history', 'learned'],
-            'pitfalls': ['pitfall', 'risk', 'warning', 'concern'],
-            'best practices': ['best practice', 'practice', 'guideline']
+            'recommendations': ['recommendation'],
+            'lessons': ['lesson'],
+            'pitfalls': ['pitfall'],
+            'best practices': ['best practice', 'practice']
         }
         
         patterns = search_patterns.get(section_name.lower(), [section_name.lower()])
@@ -451,18 +453,23 @@ Keep responses concise and actionable.
             line_lower = line.lower()
             stripped = line.strip()
             
-            # Check if this line is a section header (only lines starting with # are headers)
-            is_section_header = (stripped.startswith('#') and len(stripped) > 1)
+            # Check if this line is a section header:
+            # - Markdown headers: starts with #
+            # - Numbered lists with bold: contains **Section**: or **Section**
+            # - Bold headers: **Section**
+            is_section_header = (
+                (stripped.startswith('#') and len(stripped) > 1) or
+                ('**' in stripped and ':' in stripped) or
+                (stripped.startswith(('1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.')) and '**' in stripped)
+            )
             
             # Check if this line matches our section
             if is_section_header and any(pattern in line_lower for pattern in patterns):
                 in_section = True
-                # Skip the header line itself and continue to next iteration
-            
+                # Skip the header line itself
             # Check if we've hit a new section header (stop collecting)
             elif in_section and is_section_header:
                 break
-            
             # Collect lines if we're in the right section
             elif in_section and stripped:
                 section_lines.append(line)

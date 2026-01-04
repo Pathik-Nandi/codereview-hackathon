@@ -167,9 +167,9 @@ output:
     request_changes_threshold: "high"
     
   slack:
-    enabled: true
-    mention_on_critical: true
-    channel_notifications: true
+    enabled: false
+    mention_on_critical: false
+    channel_notifications: false
     
   dashboard:
     enabled: true

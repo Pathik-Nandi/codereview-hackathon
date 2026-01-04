@@ -42,13 +42,17 @@ class DatabaseService:
         
         self.connection_string = f"postgresql://{username}:{password}@{host}:{port}/{database}"
         
-        # Create engine
+        # Create engine with optimized settings for performance
         self.engine = create_engine(
             self.connection_string,
             pool_size=DB_POOL_SIZE,
             max_overflow=DB_MAX_OVERFLOW,
             pool_pre_ping=True,  # Verify connections before using
-            echo=config.get('database', {}).get('echo', False)
+            pool_recycle=3600,  # Recycle connections after 1 hour
+            echo=False,  # Disable SQL echo for performance
+            connect_args={
+                "options": "-c statement_timeout=30000"  # 30 second query timeout
+            }
         )
         
         # Create session factory
@@ -129,23 +133,40 @@ class DatabaseService:
                     pr_number=pr_data.get('pr_number')
                 )
                 
-                # Update user statistics
-                self._update_user_statistics(
-                    session,
-                    pr_data.get('author', {}).get('login'),
-                    author_email,
-                    pr_analysis
-                )
+                # Update user statistics (wrapped to prevent rollback on stats failure)
+                try:
+                    self._update_user_statistics(
+                        session,
+                        pr_data.get('author', {}).get('login'),
+                        author_email,
+                        pr_analysis
+                    )
+                except Exception as stats_error:
+                    logger.warning(f"Failed to update user statistics: {stats_error}")
                 
-                # Flush to persist and make the object detached from session
-                session.flush()
+                # Commit the transaction explicitly
+                session.commit()
+                logger.info(f"Database transaction committed for PR analysis {pr_analysis.id}")
                 
-                # Make the object detached from session before returning
-                session.expunge(pr_analysis)
+                # Refresh to ensure all attributes are loaded
+                session.refresh(pr_analysis)
                 
-                return pr_analysis
+                # Return a dictionary with key attributes instead of the expunged object
+                # This prevents "object has been deleted" errors when accessing attributes later
+                return type('PRAnalysis', (), {
+                    'id': pr_analysis.id,
+                    'repository': pr_analysis.repository,
+                    'pr_number': pr_analysis.pr_number,
+                    'author_login': pr_analysis.author_login,
+                    'author_email': pr_analysis.author_email,
+                    'overall_quality_score': pr_analysis.overall_quality_score,
+                    'security_score': pr_analysis.security_score,
+                    'maintainability_score': pr_analysis.maintainability_score,
+                    'total_issues': pr_analysis.total_issues
+                })()
                 
             except SQLAlchemyError as e:
+                session.rollback()
                 logger.error("Failed to save PR analysis", error=str(e))
                 raise
     
@@ -294,7 +315,9 @@ class DatabaseService:
         )
     
     def _save_issues(self, session: Session, pr_analysis_id: int, analysis_result: Dict):
-        """Save individual issues to database."""
+        """Save individual issues to database using bulk insert for performance."""
+        issues_to_insert = []
+        
         for agent_name, agent_data in analysis_result.get('agent_breakdown', {}).items():
             for issue in agent_data.get('issues', []):
                 pr_issue = PRIssue(
@@ -314,7 +337,11 @@ class DatabaseService:
                     # colliding with Base.metadata. Map incoming 'metadata' into that field.
                     issue_metadata=issue.get('metadata', {})
                 )
-                session.add(pr_issue)
+                issues_to_insert.append(pr_issue)
+        
+        # Bulk insert all issues at once for better performance
+        if issues_to_insert:
+            session.add_all(issues_to_insert)
     
     def _save_metrics(self, session: Session, pr_analysis_id: int, analysis_result: Dict):
         """Save detailed metrics to database."""
@@ -460,7 +487,13 @@ class DatabaseService:
                 'best_practices': rag_insights.get('best_practices', ''),
                 'similar_prs_found': metadata.get('similar_prs_found', 0),
                 'best_practices_found': metadata.get('best_practices_found', 0),
-                'generated_at': datetime.now(timezone.utc).isoformat()
+                'generated_at': datetime.now(timezone.utc).isoformat(),
+                'novelty_score': metadata.get('novelty_score', 0.0),
+                'risk_score': metadata.get('risk_score', 0.0),
+                'tips': rag_insights.get('tips', []),
+                'similar_prs': rag_insights.get('similar_prs', []),
+                'recommendations_count': metadata.get('recommendations_count', 0),
+                'patterns_identified': metadata.get('patterns_identified', [])
             }
             
             return insights_to_store

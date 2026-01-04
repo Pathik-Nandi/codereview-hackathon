@@ -170,8 +170,86 @@ def generate_monthly_comment_statistics():
         }
 
 
+@celery_app.task(name='tasks.generate_user_analytics_daily')
+def generate_user_analytics_daily():
+    """
+    Celery task to generate user analytics for all active users.
+    Respects the 4-hour rule - only generates if last run was 4+ hours ago.
+    
+    Returns:
+        Analytics generation result dictionary
+    """
+    try:
+        from services.generate_user_analytics import UserAnalyticsGenerator
+        
+        generator = UserAnalyticsGenerator()
+        result = generator.generate_for_all_users(force=False)  # Respect 4-hour rule
+        
+        logger.info(
+            "Daily user analytics generation completed",
+            success=result.get('success'),
+            generated=result.get('generated', 0),
+            skipped=result.get('skipped', 0),
+            failed=result.get('failed', 0)
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error("Failed to generate daily user analytics", error=str(e))
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+@celery_app.task(name='tasks.generate_user_analytics_weekly')
+def generate_user_analytics_weekly():
+    """
+    Celery task to generate user analytics for all active users (weekly).
+    Forces regeneration regardless of last run time.
+    
+    Returns:
+        Analytics generation result dictionary
+    """
+    try:
+        from services.generate_user_analytics import UserAnalyticsGenerator
+        
+        generator = UserAnalyticsGenerator()
+        result = generator.generate_for_all_users(force=True)  # Force weekly snapshot
+        
+        logger.info(
+            "Weekly user analytics generation completed",
+            success=result.get('success'),
+            generated=result.get('generated', 0),
+            skipped=result.get('skipped', 0),
+            failed=result.get('failed', 0)
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error("Failed to generate weekly user analytics", error=str(e))
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
 # Configure periodic tasks (Celery Beat schedule)
 celery_app.conf.beat_schedule = {
+    # User Analytics
+    'generate-user-analytics-daily': {
+        'task': 'tasks.generate_user_analytics_daily',
+        'schedule': 86400.0,  # Every day (for testing)
+        # For production, use: 'schedule': crontab(hour=2, minute=0)  # Daily at 02:00
+    },
+    'generate-user-analytics-weekly': {
+        'task': 'tasks.generate_user_analytics_weekly',
+        'schedule': 604800.0,  # Every 7 days (for testing)
+        # For production, use: 'schedule': crontab(day_of_week=1, hour=3, minute=0)  # Monday 03:00
+    },
+    # Comment Statistics
     'generate-daily-comment-stats': {
         'task': 'tasks.generate_daily_comment_statistics',
         'schedule': 3600.0,  # Every hour (for testing, change to crontab for daily)

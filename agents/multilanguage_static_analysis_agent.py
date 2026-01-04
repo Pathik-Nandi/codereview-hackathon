@@ -265,11 +265,43 @@ class MultiLanguageStaticAnalysisAgent(BaseAgent):
         
         return issues
     
+    def _parse_flake8_output(self, stdout: str, filename: str) -> List[Issue]:
+        """Parse flake8 JSON output into issues."""
+        issues = []
+        
+        if not stdout or not stdout.strip():
+            self.logger.debug(f"Flake8: No issues found in {filename}")
+            return issues
+        
+        try:
+            flake8_data = json.loads(stdout)
+            
+            for file_path, file_issues in flake8_data.items():
+                for item in file_issues:
+                    issues.append(Issue(
+                        type=IssueType.STYLE,
+                        severity=Severity.LOW,
+                        message=item.get('text', ''),
+                        file=file_path,
+                        line=item.get('line_number'),
+                        code=item.get('code'),
+                        metadata={'tool': 'flake8', 'language': 'python'}
+                    ))
+        except json.JSONDecodeError as je:
+            self.logger.warning(f"Flake8 returned invalid JSON for {filename}: {je}")
+            self.logger.debug(f"Flake8 stdout: {stdout[:200]}")
+        
+        return issues
+
     def _run_flake8(self, files: List) -> List[Issue]:
         """Run flake8 on Python files."""
         issues = []
+        flake8_available = True
         
         for file in files:
+            if not flake8_available:
+                break
+            
             try:
                 result = subprocess.run(
                     ['flake8', '--format=json', file.filename],
@@ -278,23 +310,16 @@ class MultiLanguageStaticAnalysisAgent(BaseAgent):
                     timeout=30
                 )
                 
-                if result.stdout:
-                    flake8_data = json.loads(result.stdout)
-                    
-                    for filename, file_issues in flake8_data.items():
-                        for item in file_issues:
-                            issues.append(Issue(
-                                type=IssueType.STYLE,
-                                severity=Severity.LOW,
-                                message=item.get('text', ''),
-                                file=filename,
-                                line=item.get('line_number'),
-                                code=item.get('code'),
-                                metadata={'tool': 'flake8', 'language': 'python'}
-                            ))
+                file_issues = self._parse_flake8_output(result.stdout, file.filename)
+                issues.extend(file_issues)
                             
+            except subprocess.TimeoutExpired:
+                self.logger.error(f"Flake8 timeout for {file.filename}")
+            except FileNotFoundError:
+                self.logger.warning("Flake8 not installed - skipping Python linting")
+                flake8_available = False
             except Exception as e:
-                self.logger.error(f"Flake8 error: {e}")
+                self.logger.error(f"Flake8 error for {file.filename}: {e}")
         
         return issues
     

@@ -40,6 +40,70 @@ class GitHubService:
         
         return hmac.compare_digest(expected_signature, signature)
     
+    def _is_valid_commit_email(self, email: str) -> bool:
+        """Check if email is valid (not a noreply address)."""
+        return email and 'noreply.github.com' not in email
+    
+    def _extract_email_from_commit(self, commit, pr_author_login: str) -> Optional[str]:
+        """Extract email from a single commit if author matches PR author."""
+        try:
+            if not (commit.author and commit.author.login == pr_author_login):
+                return None
+            
+            if not (commit.commit and commit.commit.author and commit.commit.author.email):
+                return None
+            
+            email = commit.commit.author.email
+            return email if self._is_valid_commit_email(email) else None
+            
+        except Exception as commit_error:
+            self.logger.debug("Error checking commit for email", error=str(commit_error))
+            return None
+    
+    def get_author_email_from_commits(self, repository: str, pr_number: int) -> Optional[str]:
+        """
+        Try to get author email from PR commits.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            
+        Returns:
+            Email address if found, None otherwise
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            commits = pr.get_commits()
+            
+            # Try to get email from commits by the PR author
+            for commit in commits:
+                email = self._extract_email_from_commit(commit, pr.user.login)
+                if email:
+                    self.logger.info(
+                        "Found author email from commits",
+                        repository=repository,
+                        pr_number=pr_number,
+                        email=email
+                    )
+                    return email
+            
+            self.logger.debug(
+                "No valid email found in commits",
+                repository=repository,
+                pr_number=pr_number
+            )
+            return None
+            
+        except Exception as e:
+            self.logger.error(
+                "Failed to get author email from commits",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            return None
+    
     def get_pr_details(self, repository: str, pr_number: int) -> Optional[dict]:
         """
         Get PR details from GitHub.
@@ -55,6 +119,15 @@ class GitHubService:
             repo = self.github.get_repo(repository)
             pr = repo.get_pull(pr_number)
             
+            # Try to get email from user object first
+            author_email = getattr(pr.user, 'email', None)
+            
+            # If not available, try to get from commits
+            if not author_email or 'noreply.github.com' in author_email:
+                commit_email = self.get_author_email_from_commits(repository, pr_number)
+                if commit_email:
+                    author_email = commit_email
+            
             details = {
                 'title': pr.title,
                 'body': pr.body or '',
@@ -63,7 +136,7 @@ class GitHubService:
                 'user': {
                     'login': pr.user.login,
                     'id': pr.user.id,
-                    'email': getattr(pr.user, 'email', None),
+                    'email': author_email,
                     'name': getattr(pr.user, 'name', None)
                 },
                 'head': {
@@ -82,7 +155,8 @@ class GitHubService:
                 "Retrieved PR details",
                 repository=repository,
                 pr_number=pr_number,
-                title=pr.title
+                title=pr.title,
+                author_email=author_email
             )
             
             return details
@@ -140,7 +214,72 @@ class GitHubService:
             )
             raise
     
-    def post_comment(self, repository: str, pr_number: int, comment: str) -> bool:
+    def has_existing_comments_or_reviews(self, repository: str, pr_number: int) -> bool:
+        """
+        Check if a PR already has any comments or reviews.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            
+        Returns:
+            True if PR has existing comments or reviews, False otherwise
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            
+            # Check for issue comments
+            issue_comments_count = pr.get_issue_comments().totalCount
+            if issue_comments_count > 0:
+                self.logger.info(
+                    "PR has existing issue comments",
+                    repository=repository,
+                    pr_number=pr_number,
+                    count=issue_comments_count
+                )
+                return True
+            
+            # Check for review comments
+            review_comments_count = pr.get_review_comments().totalCount
+            if review_comments_count > 0:
+                self.logger.info(
+                    "PR has existing review comments",
+                    repository=repository,
+                    pr_number=pr_number,
+                    count=review_comments_count
+                )
+                return True
+            
+            # Check for PR reviews
+            reviews_count = pr.get_reviews().totalCount
+            if reviews_count > 0:
+                self.logger.info(
+                    "PR has existing reviews",
+                    repository=repository,
+                    pr_number=pr_number,
+                    count=reviews_count
+                )
+                return True
+            
+            self.logger.info(
+                "PR has no existing comments or reviews",
+                repository=repository,
+                pr_number=pr_number
+            )
+            return False
+            
+        except GithubException as e:
+            self.logger.error(
+                "Failed to check for existing comments/reviews",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            # In case of error, return False to allow processing
+            return False
+    
+    def post_comment(self, repository: str, pr_number: int, comment: str) -> Optional[dict]:
         """
         Post a comment on a PR.
         
@@ -150,20 +289,27 @@ class GitHubService:
             comment: Comment text
             
         Returns:
-            True if successful
+            Dict with comment details if successful, None otherwise
+            Dict contains: {'id': int, 'body': str, 'html_url': str, 'created_at': str}
         """
         try:
             repo = self.github.get_repo(repository)
             pr = repo.get_pull(pr_number)
-            pr.create_issue_comment(comment)
+            comment_obj = pr.create_issue_comment(comment)
             
             self.logger.info(
                 "Posted PR comment",
                 repository=repository,
-                pr_number=pr_number
+                pr_number=pr_number,
+                comment_id=comment_obj.id
             )
             
-            return True
+            return {
+                'id': comment_obj.id,
+                'body': comment_obj.body,
+                'html_url': comment_obj.html_url,
+                'created_at': comment_obj.created_at.isoformat() if comment_obj.created_at else None
+            }
             
         except GithubException as e:
             self.logger.error(
@@ -172,7 +318,7 @@ class GitHubService:
                 pr_number=pr_number,
                 error=str(e)
             )
-            return False
+            return None
     
     def create_review(
         self, 
@@ -443,7 +589,7 @@ class GitHubService:
         line_number: int,
         comment_body: str,
         side: str = "RIGHT"
-    ) -> bool:
+    ) -> Optional[dict]:
         """
         Post an inline comment on a specific line of a PR file.
         
@@ -457,14 +603,20 @@ class GitHubService:
             side: Which side of diff (RIGHT for new, LEFT for old)
             
         Returns:
-            True if successful
+            Dict with comment details if successful, None otherwise
+            Dict contains: {'id': int, 'body': str, 'path': str, 'line': int}
+            
+        Note:
+            GitHub API only allows comments on lines that are part of the PR's diff.
+            If the line is not in the diff, a 422 error will be returned and this
+            method will return None.
         """
         try:
             repo = self.github.get_repo(repository)
             pr = repo.get_pull(pr_number)
             
             # Create review comment on specific line
-            pr.create_review_comment(
+            comment_obj = pr.create_review_comment(
                 body=comment_body,
                 commit=repo.get_commit(commit_sha),
                 path=file_path,
@@ -477,21 +629,53 @@ class GitHubService:
                 repository=repository,
                 pr_number=pr_number,
                 file=file_path,
-                line=line_number
+                line=line_number,
+                comment_id=comment_obj.id
             )
             
-            return True
+            try:
+                return {
+                    'id': comment_obj.id,
+                    'body': comment_obj.body,
+                    'path': comment_obj.path,
+                    'line': comment_obj.line
+                }
+            except Exception as e:
+                # If accessing properties fails, just return the ID
+                self.logger.warning(
+                    "Could not access all comment properties, returning ID only",
+                    comment_id=comment_obj.id,
+                    error=str(e)
+                )
+                return {
+                    'id': comment_obj.id,
+                    'body': comment_body,
+                    'path': file_path,
+                    'line': line_number
+                }
             
         except GithubException as e:
-            self.logger.error(
-                "Failed to post inline comment",
-                repository=repository,
-                pr_number=pr_number,
-                file=file_path,
-                line=line_number,
-                error=str(e)
-            )
-            return False
+            error_str = str(e)
+            # Log different messages based on error type
+            if "422" in error_str and "could not be resolved" in error_str.lower():
+                self.logger.warning(
+                    "Line not in PR diff - cannot post comment",
+                    repository=repository,
+                    pr_number=pr_number,
+                    file=file_path,
+                    line=line_number,
+                    hint="Line may not be part of the PR changes or may be invalid"
+                )
+            else:
+                self.logger.error(
+                    "Failed to post inline comment",
+                    repository=repository,
+                    pr_number=pr_number,
+                    file=file_path,
+                    line=line_number,
+                    error=error_str
+                )
+            return None
     
     def post_review_with_comments(
         self, 
@@ -501,7 +685,7 @@ class GitHubService:
         review_body: str,
         review_event: str = "COMMENT",
         inline_comments: Optional[list] = None
-    ) -> bool:
+    ) -> Optional[dict]:
         """
         Post a review with multiple inline comments at once.
         
@@ -518,7 +702,7 @@ class GitHubService:
                 - side: str (optional, defaults to "RIGHT")
             
         Returns:
-            True if successful
+            Dict with review data (id, html_url) if successful, None otherwise
         """
         try:
             repo = self.github.get_repo(repository)
@@ -537,7 +721,7 @@ class GitHubService:
                     })
             
             # Create review with all comments
-            pr.create_review(
+            review = pr.create_review(
                 body=review_body,
                 event=review_event,
                 commit=commit,
@@ -549,10 +733,17 @@ class GitHubService:
                 repository=repository,
                 pr_number=pr_number,
                 review_event_type=review_event,
-                comment_count=len(comments)
+                comment_count=len(comments),
+                review_id=review.id
             )
             
-            return True
+            # Return review data including GitHub IDs
+            return {
+                'id': review.id,
+                'html_url': review.html_url,
+                'state': review.state,
+                'body': review.body
+            }
             
         except GithubException as e:
             self.logger.error(
@@ -561,7 +752,7 @@ class GitHubService:
                 pr_number=pr_number,
                 error=str(e)
             )
-            return False
+            return None
     
     def get_file_content_at_commit(
         self,

@@ -47,15 +47,16 @@ class GitHubService:
     def _extract_email_from_commit(self, commit, pr_author_login: str) -> Optional[str]:
         """Extract email from a single commit if author matches PR author."""
         try:
-            if not (commit.author and commit.author.login == pr_author_login):
-                return None
-            
+            # Check if we have commit author data
             if not (commit.commit and commit.commit.author and commit.commit.author.email):
                 return None
-            
+
             email = commit.commit.author.email
+
+            # Only validate email format, don't check GitHub user match
+            # (email may not be associated with any GitHub account)
             return email if self._is_valid_commit_email(email) else None
-            
+
         except Exception as commit_error:
             self.logger.debug("Error checking commit for email", error=str(commit_error))
             return None

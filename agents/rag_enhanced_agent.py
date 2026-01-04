@@ -206,6 +206,12 @@ class RAGEnhancedAgent(BaseAgent):
             risk_score = self._calculate_risk_score(pr_event, rag_insights, relevant_context)
             novelty_score = self._calculate_novelty_score(relevant_context)
             
+            # Calculate average similarity for database
+            similar_prs = relevant_context.get('similar_prs', [])
+            average_similarity = 0.0
+            if similar_prs:
+                average_similarity = sum(pr.get('similarity', 0) for pr in similar_prs) / len(similar_prs)
+            
             # Step 3: Store this PR for future retrieval
             self._store_pr_for_future_retrieval(pr_event)
             
@@ -220,6 +226,7 @@ class RAGEnhancedAgent(BaseAgent):
                     'best_practices_found': len(relevant_context.get('best_practices', [])),
                     'risk_score': risk_score,
                     'novelty_score': novelty_score,
+                    'average_similarity': average_similarity,  # FIX: Add this for database
                     'recommendations_count': len(rag_insights.get('recommendations', '').split('\n')) if rag_insights.get('recommendations') else 0,
                     'patterns_identified': self._identify_patterns(pr_event),
                     'similar_prs': relevant_context.get('similar_prs', [])  # All similar PRs above threshold

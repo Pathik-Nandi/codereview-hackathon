@@ -108,48 +108,12 @@ class PRCommentAgent:
         }
         
         try:
-            # Get commit SHA - required for posting inline comments
-            if not commit_sha:
-                self.logger.warning(
-                    "No commit SHA provided, cannot post inline comments",
-                    pr_number=pr_event.pr_number,
-                    repository=pr_event.repository
-                )
-                # Post summary only (doesn't require commit SHA)
-                if self.post_summary:
-                    results['summary_posted'] = self._post_summary(pr_event, agent_result)
-                return results
+            # NOTE: Posting to GitHub is disabled. Comments are only tracked in database.
+            # This allows analysis without affecting the actual GitHub PR.
             
-            # Post inline comments as a review WITH summary as the review body
-            # This ensures only ONE summary + inline comments (no duplicate summaries)
-            review_response, inline_count, inline_comments = self._post_inline_comments_as_review(
-                pr_event, agent_result, commit_sha
-            )
-            results['inline_comments_posted'] = inline_count
-            
-            # Extract review ID if review was posted
-            github_review_id = None
-            if review_response:
-                github_review_id = str(review_response.get('id'))
-            
-            # Determine review event type
-            review_event = 'COMMENT' if review_response else None
-            
-            # Only post separate summary if review was NOT posted successfully
-            # If review succeeded, summary is already included in the review body
-            github_comment_id = None
-            if self.post_summary and not review_response:
-                summary_response = self._post_summary(pr_event, agent_result)
-                if summary_response:
-                    results['summary_posted'] = True
-                    github_comment_id = str(summary_response.get('id'))
-            elif review_response:
-                # Mark summary as posted since it was included in the review
-                results['summary_posted'] = True
-                self.logger.info(
-                    "Summary included in review, not posting separately",
-                    pr_number=pr_event.pr_number
-                )
+            # Generate inline comments for tracking
+            inline_comments = self._generate_inline_comments(agent_result)
+            results['inline_comments_posted'] = len(inline_comments)
             
             # Track comments in database (if enabled)
             if pr_analysis_id and self.track_in_database:
@@ -157,13 +121,14 @@ class PRCommentAgent:
                     pr_event=pr_event,
                     pr_analysis_id=pr_analysis_id,
                     agent_result=agent_result,
-                    summary_posted=results['summary_posted'],
+                    summary_posted=True,  # Always track summary
                     inline_comments=inline_comments,
-                    review_event=review_event,
+                    review_event=None,  # Not posting to GitHub
                     commit_sha=commit_sha,
-                    github_comment_id=github_comment_id,
-                    github_review_id=github_review_id
+                    github_comment_id=None,  # Not posted to GitHub
+                    github_review_id=None  # Not posted to GitHub
                 )
+                results['summary_posted'] = True
             
             return results
             
@@ -177,6 +142,15 @@ class PRCommentAgent:
             results['success'] = False
             results['error'] = str(e)
             return results
+    
+    def _generate_inline_comments(self, agent_result: AgentResult) -> List[Dict]:
+        """
+        Generate inline comments from analysis results without posting to GitHub.
+        Returns list of comment dictionaries.
+        """
+        inline_comments = self._build_inline_comments(agent_result)
+        # No need to limit since we're not posting to GitHub
+        return inline_comments
     
     def _post_summary(self, pr_event: PREvent, agent_result: AgentResult) -> Optional[dict]:
         """
@@ -419,7 +393,7 @@ class PRCommentAgent:
             return []
         
         lines = [
-            "### � Contextual Observations",
+            "### 🔍 Contextual Observations",
             "",
             f"**{len(contextual_issues)} observation(s)** about this PR:",
             ""
@@ -459,87 +433,113 @@ class PRCommentAgent:
         # Build comment sections
         lines = self._build_summary_header(agent_result, severity_counts, len(issues))
         lines.extend(self._build_inline_comments_section(len(inline_issues), inline_severity_counts))
-        
-        # Add Issue Breakdown section
-        lines.extend([
-            "### 🔍 Issue Breakdown",
-            "",
-            f"- 🛡️ Security Issues: {type_counts['security']}",
-            f"- 💎 Code Quality Issues: {type_counts['quality']}",
-            f"- � Complexity Issues: {type_counts['complexity']}",
-            ""
-        ])
-        
-        # Add contextual observations
+        lines.extend(self._build_issue_breakdown_section(type_counts))
         lines.extend(self._build_contextual_observations_section(contextual_issues))
-
-        
-        # Add RAG insights if available
-        if self.include_rag_insights:
-            rag_metadata = agent_result.metadata.get('rag_insights', {})
-            if rag_metadata:
-                lines.extend([
-                    "### 🧠 AI-Powered Insights",
-                    "",
-                    f"- **Novelty Score:** {rag_metadata.get('novelty_score', 0):.2f} (Higher = More unique)",
-                    f"- **Risk Score:** {rag_metadata.get('risk_score', 0):.2f} (Higher = More risky)",
-                    f"- **Similar PRs Found:** {rag_metadata.get('similar_prs_count', 0)}",
-                    ""
-                ])
-                
-                # Add RAG recommendations if available
-                recommendations = rag_metadata.get('recommendations', '')
-                if recommendations:
-                    lines.append("**Key Recommendations:**")
-                    # Split by newlines and filter out empty lines and duplicates
-                    rec_lines = [line.strip() for line in recommendations.split('\n') if line.strip()]
-                    # Remove duplicates while preserving order
-                    seen = set()
-                    unique_recs = []
-                    for rec in rec_lines:
-                        # Normalize the line (remove leading - or * if present)
-                        normalized = rec.lstrip('- *').strip()
-                        if normalized and normalized not in seen:
-                            seen.add(normalized)
-                            unique_recs.append(rec if rec.startswith(('-', '*')) else f"- {rec}")
-                    
-                    # Add top 3 unique recommendations
-                    for rec in unique_recs[:3]:
-                        lines.append(rec)
-                    lines.append("")
-        
-        # Add next steps (use severity counts)
-        critical = severity_counts['critical']
-        high = severity_counts['high']
-        
-        if critical > 0:
-            lines.extend([
-                "### ⚠️ Action Required",
-                "",
-                f"This PR has **{critical} critical issue(s)** that should be addressed before merging.",
-                ""
-            ])
-        elif high > 0:
-            lines.extend([
-                "### 💡 Recommendations",
-                "",
-                f"Consider addressing the **{high} high-priority issue(s)** for better code quality.",
-                ""
-            ])
-        else:
-            lines.extend([
-                "### ✅ Looking Good!",
-                "",
-                "No critical or high-priority issues found. Review the inline comments for minor improvements.",
-                ""
-            ])
-        
+        lines.extend(self._build_rag_insights_section(agent_result))
+        lines.extend(self._build_action_required_section(severity_counts))
         lines.extend([
             "---",
             "*This is an automated review. Please review the inline comments for specific details.*"
         ])
         
         return "\n".join(lines)
+    
+    def _build_issue_breakdown_section(self, type_counts: Dict[str, int]) -> List[str]:
+        """Build the issue breakdown section."""
+        return [
+            "### 🔍 Issue Breakdown",
+            "",
+            f"- 🛡️ Security Issues: {type_counts['security']}",
+            f"- 💎 Code Quality Issues: {type_counts['quality']}",
+            f"- 🔧 Complexity Issues: {type_counts['complexity']}",
+            ""
+        ]
+    
+    def _build_rag_insights_section(self, agent_result: AgentResult) -> List[str]:
+        """Build the RAG AI-powered insights section."""
+        if not self.include_rag_insights:
+            return []
+        
+        rag_metadata = agent_result.metadata.get('rag_insights', {})
+        if not rag_metadata:
+            return []
+        
+        lines = [
+            "### 🧠 AI-Powered Insights",
+            "",
+            f"- **Novelty Score:** {rag_metadata.get('novelty_score', 0):.2f} (Higher = More unique)",
+            f"- **Risk Score:** {rag_metadata.get('risk_score', 0):.2f} (Higher = More risky)",
+            f"- **Similar PRs Found:** {rag_metadata.get('similar_prs_count', 0)}",
+            ""
+        ]
+        
+        # Add learned patterns if available
+        learned_patterns = rag_metadata.get('learned_patterns', [])
+        if learned_patterns:
+            lines.append("**Learned Patterns:**")
+            for pattern in learned_patterns:
+                lines.append(f"- {pattern}")
+            lines.append("")
+        
+        # Add RAG recommendations if available
+        lines.extend(self._format_rag_recommendations(rag_metadata.get('recommendations', '')))
+        
+        return lines
+    
+    def _format_rag_recommendations(self, recommendations: str) -> List[str]:
+        """Format RAG recommendations, removing duplicates."""
+        if not recommendations:
+            return []
+        
+        lines = ["**Key Recommendations:**"]
+        
+        # Split by newlines and filter out empty lines and duplicates
+        rec_lines = [line.strip() for line in recommendations.split('\n') if line.strip()]
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_recs = []
+        for rec in rec_lines:
+            # Normalize the line (remove leading - or * if present)
+            normalized = rec.lstrip('- *').strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                unique_recs.append(rec if rec.startswith(('-', '*')) else f"- {rec}")
+        
+        # Add top 3 unique recommendations
+        for rec in unique_recs[:3]:
+            lines.append(rec)
+        lines.append("")
+        
+        return lines
+    
+    def _build_action_required_section(self, severity_counts: Dict[str, int]) -> List[str]:
+        """Build the action required / next steps section."""
+        critical = severity_counts['critical']
+        high = severity_counts['high']
+        
+        if critical > 0:
+            return [
+                "### ⚠️ Action Required",
+                "",
+                f"This PR has **{critical} critical issue(s)** that should be addressed before merging.",
+                ""
+            ]
+        
+        if high > 0:
+            return [
+                "### 💡 Recommendations",
+                "",
+                f"Consider addressing the **{high} high-priority issue(s)** for better code quality.",
+                ""
+            ]
+        
+        return [
+            "### ✅ Looking Good!",
+            "",
+            "No critical or high-priority issues found. Review the inline comments for minor improvements.",
+            ""
+        ]
 
     
     def _build_inline_comments(self, agent_result: AgentResult) -> List[Dict]:
@@ -863,15 +863,16 @@ class PRCommentAgent:
         try:
             comments_to_track = []
             
-            # Track summary comment
-            if summary_posted:
-                summary_record = self._create_summary_comment_record(
-                    pr_event, pr_analysis_id, agent_result, commit_sha,
-                    review_event, github_comment_id, github_review_id
-                )
-                comments_to_track.append(summary_record)
+            # Always track summary comment in database (even if not posted to GitHub)
+            # This ensures we have a record of all analysis results
+            summary_record = self._create_summary_comment_record(
+                pr_event, pr_analysis_id, agent_result, commit_sha,
+                review_event, github_comment_id if summary_posted else None, 
+                github_review_id
+            )
+            comments_to_track.append(summary_record)
             
-            # Track inline comments
+            # Always track inline comments in database (even if not posted to GitHub)
             for comment in inline_comments:
                 inline_record = self._create_inline_comment_record(
                     pr_event, pr_analysis_id, comment, commit_sha,
@@ -879,21 +880,87 @@ class PRCommentAgent:
                 )
                 comments_to_track.append(inline_record)
             
-            # Save to database
+            # Save to database using UPSERT logic (update if exists, insert if new)
             if comments_to_track:
-                with self.db_service.get_session() as session:
-                    try:
-                        for comment in comments_to_track:
-                            session.add(comment)
-                        session.commit()
-                        self.logger.info(
-                            "Tracked comments in database",
-                            pr_analysis_id=pr_analysis_id,
-                            count=len(comments_to_track)
-                        )
-                    except Exception as e:
-                        session.rollback()
-                        self.logger.error("Failed to track comments in database", error=str(e))
+                self._upsert_comments_to_database(pr_analysis_id, comments_to_track)
                     
         except Exception as e:
             self.logger.error("Error tracking comments", error=str(e), exc_info=True)
+    
+    def _upsert_comments_to_database(self, pr_analysis_id: int, comments_to_track: list):
+        """
+        Insert or update comments in database.
+        Updates existing comments instead of creating duplicates.
+        Uniqueness based on: pr_analysis_id + comment_type + file_path + line_number
+        """
+        from models.database import PRComment
+        from sqlalchemy import and_
+        
+        with self.db_service.get_session() as session:
+            try:
+                inserted_count = 0
+                updated_count = 0
+                
+                for comment in comments_to_track:
+                    # Build query to find existing comment
+                    query = session.query(PRComment).filter(
+                        and_(
+                            PRComment.pr_analysis_id == comment.pr_analysis_id,
+                            PRComment.comment_type == comment.comment_type
+                        )
+                    )
+                    
+                    # Add file/line filters for inline comments
+                    if comment.comment_type == 'inline' and comment.file_path:
+                        query = query.filter(
+                            and_(
+                                PRComment.file_path == comment.file_path,
+                                PRComment.line_number == comment.line_number
+                            )
+                        )
+                    
+                    existing = query.first()
+                    
+                    if existing:
+                        # Update existing comment
+                        existing.comment_body = comment.comment_body
+                        existing.comment_preview = comment.comment_preview
+                        existing.commit_sha = comment.commit_sha
+                        existing.issue_severity = comment.issue_severity
+                        existing.issue_type = comment.issue_type
+                        existing.github_comment_id = comment.github_comment_id
+                        existing.github_review_id = comment.github_review_id
+                        existing.posted_successfully = comment.posted_successfully
+                        existing.last_checked_at = datetime.now(timezone.utc)
+                        updated_count += 1
+                        self.logger.debug(
+                            "Updating existing comment",
+                            pr_analysis_id=pr_analysis_id,
+                            comment_type=comment.comment_type,
+                            file_path=comment.file_path,
+                            line=comment.line_number
+                        )
+                    else:
+                        # Insert new comment
+                        session.add(comment)
+                        inserted_count += 1
+                        self.logger.debug(
+                            "Inserting new comment",
+                            pr_analysis_id=pr_analysis_id,
+                            comment_type=comment.comment_type,
+                            file_path=comment.file_path,
+                            line=comment.line_number
+                        )
+                
+                session.commit()
+                self.logger.info(
+                    "Tracked comments in database",
+                    pr_analysis_id=pr_analysis_id,
+                    inserted=inserted_count,
+                    updated=updated_count,
+                    total=len(comments_to_track)
+                )
+            except Exception as e:
+                session.rollback()
+                self.logger.error("Failed to track comments in database", error=str(e))
+

@@ -148,25 +148,22 @@ class DatabaseService:
                 session.commit()
                 logger.info(f"Database transaction committed for PR analysis {pr_analysis.id}")
                 
-                # Refresh to ensure all attributes are loaded before detaching
-                # This prevents "object has been deleted" errors
+                # Refresh to ensure all attributes are loaded
                 session.refresh(pr_analysis)
                 
-                # Make a copy of the ID before expunging (needed for return)
-                pr_analysis_id = pr_analysis.id
-                pr_analysis_attrs = {
+                # Return a dictionary with key attributes instead of the expunged object
+                # This prevents "object has been deleted" errors when accessing attributes later
+                return type('PRAnalysis', (), {
                     'id': pr_analysis.id,
                     'repository': pr_analysis.repository,
                     'pr_number': pr_analysis.pr_number,
                     'author_login': pr_analysis.author_login,
+                    'author_email': pr_analysis.author_email,
                     'overall_quality_score': pr_analysis.overall_quality_score,
-                    'security_score': pr_analysis.security_score
-                }
-                
-                # Expunge to detach from session (prevents lazy-load errors after session closes)
-                session.expunge(pr_analysis)
-                
-                return pr_analysis
+                    'security_score': pr_analysis.security_score,
+                    'maintainability_score': pr_analysis.maintainability_score,
+                    'total_issues': pr_analysis.total_issues
+                })()
                 
             except SQLAlchemyError as e:
                 session.rollback()
@@ -490,7 +487,13 @@ class DatabaseService:
                 'best_practices': rag_insights.get('best_practices', ''),
                 'similar_prs_found': metadata.get('similar_prs_found', 0),
                 'best_practices_found': metadata.get('best_practices_found', 0),
-                'generated_at': datetime.now(timezone.utc).isoformat()
+                'generated_at': datetime.now(timezone.utc).isoformat(),
+                'novelty_score': metadata.get('novelty_score', 0.0),
+                'risk_score': metadata.get('risk_score', 0.0),
+                'tips': rag_insights.get('tips', []),
+                'similar_prs': rag_insights.get('similar_prs', []),
+                'recommendations_count': metadata.get('recommendations_count', 0),
+                'patterns_identified': metadata.get('patterns_identified', [])
             }
             
             return insights_to_store

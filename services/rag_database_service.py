@@ -167,8 +167,13 @@ class RAGDatabaseService:
                 'similar_prs': metadata.get('similar_prs', []),
                 
                 # Recommendations list (for rag_recommendations)
-                'recommendations_list': self._parse_recommendations(rag_insights.get('recommendations', ''))
+                'recommendations_list': self._parse_recommendations(rag_insights.get('recommendations', '')),
+                
+                # Learned patterns (from patterns_identified in metadata)
+                'patterns_identified': metadata.get('patterns_identified', [])
             }
+            
+            logger.info(f"DEBUG: Extracted {len(extracted_data.get('patterns_identified', []))} patterns from metadata")
             
             return extracted_data
             
@@ -409,12 +414,33 @@ class RAGDatabaseService:
         pr_analysis_id: int,
         rag_data: Dict
     ):
-        """Save learned patterns extracted from lessons and pitfalls."""
+        """Save learned patterns extracted from lessons and pitfalls, plus patterns_identified from RAG agent."""
         logger.info(f"DEBUG: _save_learned_patterns called for insight {rag_insight_id}")
         try:
             patterns = []
             
-            # Extract patterns from lessons learned
+            # First, check if we have patterns_identified directly from RAG agent metadata
+            patterns_identified = rag_data.get('patterns_identified', [])
+            if patterns_identified:
+                logger.info(f"DEBUG: Found {len(patterns_identified)} patterns from patterns_identified")
+                # Convert patterns_identified to the expected format
+                # patterns_identified format: ['file_types: py', 'change_type: feature_addition', 'size: small']
+                for pattern_str in patterns_identified:
+                    if ':' in pattern_str:
+                        category, value = pattern_str.split(':', 1)
+                        category = category.strip()
+                        value = value.strip()
+                        patterns.append({
+                            'name': pattern_str,
+                            'category': 'code_pattern',  # Default category
+                            'type': category,  # e.g., 'file_types', 'change_type', 'size'
+                            'description': f"Pattern identified: {pattern_str}",
+                            'symptoms': '',
+                            'causes': '',
+                            'solution': ''
+                        })
+            
+            # Also extract patterns from lessons learned text
             lessons = rag_data.get('lessons_learned', '')
             if lessons:
                 patterns.extend(self._extract_patterns_from_text(
@@ -438,7 +464,7 @@ class RAGDatabaseService:
                     'best_practice'
                 ))
             
-            logger.info(f"DEBUG: Extracted {len(patterns)} patterns")
+            logger.info(f"DEBUG: Total extracted {len(patterns)} patterns")
             
             # Save each pattern
             for pattern in patterns:
@@ -457,7 +483,8 @@ class RAGDatabaseService:
                 }).fetchone()
                 
                 if existing:
-                    # Update existing pattern
+                    # Update existing pattern - simple append without duplicate check
+                    # Keep only last 10 PR IDs
                     update_sql = text("""
                         UPDATE rag_learned_patterns 
                         SET times_observed = times_observed + 1,
@@ -465,15 +492,14 @@ class RAGDatabaseService:
                             last_observed_at = NOW(),
                             updated_at = NOW(),
                             example_prs = (
-                                SELECT jsonb_agg(DISTINCT elem)
+                                SELECT jsonb_agg(elem)
                                 FROM (
                                     SELECT elem FROM jsonb_array_elements(
-                                        COALESCE(example_prs, '[]'::jsonb)
+                                        COALESCE(CAST(example_prs AS jsonb), '[]'::jsonb) || CAST(:pr_id_json AS jsonb)
                                     ) elem
-                                    UNION
-                                    SELECT :pr_id::text::jsonb
-                                ) t(elem)
-                                LIMIT 10
+                                    ORDER BY elem DESC
+                                    LIMIT 10
+                                ) t
                             )
                         WHERE id = :pattern_id
                     """)
@@ -481,7 +507,7 @@ class RAGDatabaseService:
                     session.execute(update_sql, {
                         'pattern_id': existing.id,
                         'last_observed_in_pr': pr_analysis_id,
-                        'pr_id': pr_analysis_id
+                        'pr_id_json': f'"{pr_analysis_id}"'
                     })
                 else:
                     # Insert new pattern

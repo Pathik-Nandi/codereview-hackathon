@@ -553,13 +553,13 @@ def _get_head_sha_from_pr_details(pr_details: dict, repository: str, pr_number: 
     return None
 
 
-def _handle_pr_comments_posting(pr_event, result, pr_details, persistence_result, response_data, repository, pr_number):
-    """Handle posting comments to PR."""
+def _handle_pr_comments_tracking(pr_event, result, pr_details, persistence_result, response_data, repository, pr_number):
+    """Handle tracking comments in database (update if exists, insert if new)."""
     try:
         head_sha = _get_head_sha_from_pr_details(pr_details, repository, pr_number)
         
         logger.info(
-            "Preparing to post PR comments",
+            "Preparing to track PR comments in database",
             repository=repository,
             pr_number=pr_number,
             head_sha=head_sha
@@ -568,6 +568,7 @@ def _handle_pr_comments_posting(pr_event, result, pr_details, persistence_result
         # Get pr_analysis_id from persistence result
         pr_analysis_id = persistence_result.get('pr_analysis_id') if persistence_result else None
         
+        # Track comments in database (post_comments=False means don't post to GitHub)
         comment_result = pr_comment_agent.post_analysis_comments(
             pr_event=pr_event,
             agent_result=result,
@@ -575,18 +576,18 @@ def _handle_pr_comments_posting(pr_event, result, pr_details, persistence_result
             pr_analysis_id=pr_analysis_id
         )
         
-        response_data['comments_posted'] = comment_result
+        response_data['comments_tracked'] = comment_result
         logger.info(
-            "Posted PR comments",
+            "Tracked PR comments in database",
             repository=repository,
             pr_number=pr_number,
-            summary_posted=comment_result.get('summary_posted'),
+            summary_tracked=comment_result.get('summary_posted'),  # Note: 'posted' flag still used internally
             inline_count=comment_result.get('inline_comments_posted')
         )
         
     except Exception as comment_error:
         logger.error(
-            "Failed to post PR comments",
+            "Failed to track PR comments",
             error=str(comment_error),
             repository=repository,
             pr_number=pr_number
@@ -632,34 +633,6 @@ def _handle_slack_notifications(pr_event, result, repository, pr_number, respons
         response_data['slack_error'] = str(slack_error)
 
 
-def _check_skip_if_has_comments(repository: str, pr_number: int, skip_if_has_comments: bool) -> Optional[tuple]:
-    """Check if PR should be skipped because it already has comments."""
-    if not skip_if_has_comments:
-        return None
-    
-    try:
-        if github_service.has_existing_comments_or_reviews(repository, pr_number):
-            logger.info(
-                "Skipping PR analysis - already has comments or reviews",
-                repository=repository,
-                pr_number=pr_number
-            )
-            return jsonify({
-                'status': 'skipped',
-                'message': 'PR already has existing comments or reviews',
-                'repository': repository,
-                'pr_number': pr_number
-            }), 200
-    except Exception as check_error:
-        logger.warning(
-            "Failed to check for existing comments, continuing with analysis",
-            repository=repository,
-            pr_number=pr_number,
-            error=str(check_error)
-        )
-    return None
-
-
 @app.route('/api/analyze', methods=['POST'])
 def analyze_pr():
     """
@@ -676,6 +649,12 @@ def analyze_pr():
     The system will automatically fetch PR details from GitHub.
     If author_email is provided, it will be used for tracking the PR.
     Otherwise, the system will try to get email from GitHub or git commits.
+    
+    The system will:
+    - Always analyze the PR
+    - Always save comments to database
+    - Update existing comments if they already exist in database
+    - Never post comments to GitHub (comments stored locally only)
     """
     try:
         data = request.json
@@ -702,12 +681,7 @@ def analyze_pr():
         
         pr_event, pr_details = pr_data_tuple
         
-        # Check if PR already has comments or reviews (skip if it does)
-        skip_result = _check_skip_if_has_comments(repository, pr_number, data.get('skip_if_has_comments', True))
-        if skip_result:
-            return skip_result
-        
-        # Dispatch to agent
+        # Dispatch to agent (always analyze)
         result = dispatcher.dispatch(pr_event, agent_type)
         
         # Build response
@@ -716,10 +690,9 @@ def analyze_pr():
         # Persist to database
         persistence_result = _persist_analysis(pr_event, pr_details, result, data, response_data)
         
-        # Post comments to PR if enabled (check config or request parameter)
-        post_comments = data.get('post_comments', config.get('pr_comments.enabled', True))
-        if pr_comment_agent and post_comments:
-            _handle_pr_comments_posting(pr_event, result, pr_details, persistence_result, 
+        # Always track comments in database (update if exists, insert if new)
+        if pr_comment_agent:
+            _handle_pr_comments_tracking(pr_event, result, pr_details, persistence_result, 
                                        response_data, repository, pr_number)
         
         # Send Slack Notifications

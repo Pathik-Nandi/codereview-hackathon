@@ -282,26 +282,33 @@ class RAGEnhancedAgent(BaseAgent):
             )
             
             # Process results and filter by similarity threshold
-            similarity_threshold = 0.4  # Stricter threshold (40%) for better matches
+            # ChromaDB returns squared L2 distance - smaller is better
+            # For normalized embeddings, L2 distance ≈ sqrt(2 * (1 - cosine_similarity))
+            # So distance of 0.8 ≈ cosine similarity of 0.68
+            max_distance = 1.2  # Corresponds to ~0.28 cosine similarity threshold
             
             if results and results['documents']:
                 for i, doc in enumerate(results['documents'][0]):
                     metadata = results['metadatas'][0][i]
                     distance = results['distances'][0][i]
-                    similarity = 1 - distance  # Convert distance to similarity
                     
-                    # Only include PRs that meet similarity threshold
-                    if similarity >= similarity_threshold:
+                    # Convert L2 distance to approximate cosine similarity
+                    # For normalized vectors: cosine_sim ≈ 1 - (L2_distance² / 2)
+                    similarity = max(0, 1 - (distance / 2))
+                    
+                    # Only include PRs that are reasonably similar (distance < 1.2)
+                    if distance < max_distance:
                         context['similar_prs'].append({
                             'pr_number': metadata.get('pr_number'),
                             'pr_title': metadata.get('pr_title'),
                             'issues_found': metadata.get('issues_found'),
                             'similarity_score': similarity,
                             'similarity': similarity,  # For compatibility
-                            'summary': doc[:200]  # First 200 chars
+                            'summary': doc[:200],  # First 200 chars
+                            'distance': distance  # Include raw distance for debugging
                         })
             
-            logger.info(f"Retrieved {len(context['similar_prs'])} similar PRs (threshold: {similarity_threshold})")
+            logger.info(f"Retrieved {len(context['similar_prs'])} similar PRs (max_distance: {max_distance})")
             
         except Exception as e:
             logger.error(f"Context retrieval failed: {e}")
@@ -434,10 +441,10 @@ Provide brief, actionable insights (1-2 points each):
         
         # Map search terms to more flexible patterns
         search_patterns = {
-            'recommendations': ['recommendation', 'suggest', 'advice'],
-            'lessons': ['lesson', 'history', 'learned'],
-            'pitfalls': ['pitfall', 'risk', 'warning', 'concern'],
-            'best practices': ['best practice', 'practice', 'guideline']
+            'recommendations': ['recommendation'],
+            'lessons': ['lesson'],
+            'pitfalls': ['pitfall'],
+            'best practices': ['best practice', 'practice']
         }
         
         patterns = search_patterns.get(section_name.lower(), [section_name.lower()])
@@ -446,18 +453,23 @@ Provide brief, actionable insights (1-2 points each):
             line_lower = line.lower()
             stripped = line.strip()
             
-            # Check if this line is a section header (only lines starting with # are headers)
-            is_section_header = (stripped.startswith('#') and len(stripped) > 1)
+            # Check if this line is a section header:
+            # - Markdown headers: starts with #
+            # - Numbered lists with bold: contains **Section**: or **Section**
+            # - Bold headers: **Section**
+            is_section_header = (
+                (stripped.startswith('#') and len(stripped) > 1) or
+                ('**' in stripped and ':' in stripped) or
+                (stripped.startswith(('1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.')) and '**' in stripped)
+            )
             
             # Check if this line matches our section
             if is_section_header and any(pattern in line_lower for pattern in patterns):
                 in_section = True
-                # Skip the header line itself and continue to next iteration
-            
+                # Skip the header line itself
             # Check if we've hit a new section header (stop collecting)
             elif in_section and is_section_header:
                 break
-            
             # Collect lines if we're in the right section
             elif in_section and stripped:
                 section_lines.append(line)

@@ -24,10 +24,17 @@ def truncate_all_tables():
     tables = [
         'pr_comments',
         'pr_comment_statistics',
+        'rag_similar_pr_references',
+        'rag_recommendations',
+        'rag_learned_patterns',
         'rag_insights',
         'pr_issues',
         'pr_metrics',
-        'pr_analysis'
+        'pr_analysis',
+        'best_practices',
+        'trend_analysis',
+        'user_analytics',
+        'user_statistics'
     ]
     
     print(f"\n⚠️  WARNING: About to truncate {len(tables)} tables:")

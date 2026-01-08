@@ -100,11 +100,64 @@ agents:
     min_coverage_threshold: 80.0
     check_coverage: true
     analyze_complexity: true
+  
+  # AI Summary Agent (DEPRECATED - Use rag_enhanced instead)
+  # RAG includes all AI Summary features plus historical context
+  ai_summary:
+    enabled: false  # Deprecated: RAG Enhanced Agent replaces this
+    provider: "gemini"
+    # Note: This agent is kept for backward compatibility only
+    # Use rag_enhanced agent for better results with historical context
+  
+  # RAG Enhanced Agent (Recommended - replaces ai_summary)
+  # Set RAG_ENABLED=true, AI_PROVIDER, and GEMINI_API_KEY/OPENAI_API_KEY in .env
+  # Install: pip install chromadb sentence-transformers
+  rag_enhanced:
+    enabled: true  # Set to true to enable RAG-powered context-aware analysis
+    vector_db_path: "./vector_db"  # Path to ChromaDB persistent storage
+    embedding_model: "all-MiniLM-L6-v2"  # SentenceTransformer model for embeddings
+    
+    # AI Model Configuration
+    # Provider: 'openai' or 'gemini' (set via AI_PROVIDER env var or defaults to config)
+    ai_provider: "openai"  # Default provider: 'openai' or 'gemini'
+    
+    # OpenAI Models (when ai_provider = 'openai')
+    openai_model: "gpt-4o-mini"  # Options: gpt-4, gpt-4o, gpt-4o-mini, gpt-3.5-turbo
+    
+    # Gemini Models (when ai_provider = 'gemini')
+    gemini_model: "gemini-1.5-flash"  # Options: gemini-1.5-flash, gemini-1.5-pro, gemini-pro
+    
+    top_k: 5  # Number of similar PRs to retrieve
+    min_similarity: 0.7  # Minimum similarity score (0-1) for relevance
+    index_batch_size: 50  # Batch size for indexing historical PRs
+    auto_index: true  # Automatically index new PRs after analysis
+    # Features:
+    # - Retrieves similar historical PRs using semantic search
+    # - Learns from past issues and solutions
+    # - Provides context-aware recommendations
+    # - Identifies recurring patterns
+    # - Suggests best practices from successful PRs
+    # Note: RAG includes all AI Summary features + historical context
 
 feedback_aggregator:
   prioritize_security: true
   group_by_severity: true
   include_suggestions: true
+
+# PR Comments Configuration
+pr_comments:
+  enabled: true  # Enable/disable automated PR commenting
+  track_in_database: true  # Track all posted comments in database for analytics
+  post_summary: true  # Post a summary comment on the PR
+  post_inline_comments: true  # Post inline comments on specific lines
+  max_inline_comments: 500  # Maximum number of inline comments per PR
+  severity_threshold: "LOW"  # Minimum severity to comment: CRITICAL, HIGH, MEDIUM, LOW, INFO
+  group_by_file: true  # Group comments by file
+  include_rag_insights: true  # Include RAG insights in summary
+  # Review behavior:
+  # - REQUEST_CHANGES if critical issues found
+  # - COMMENT for all other cases
+  # - Never auto-approves (requires manual review)
 
 output:
   github:
@@ -114,9 +167,9 @@ output:
     request_changes_threshold: "high"
     
   slack:
-    enabled: true
-    mention_on_critical: true
-    channel_notifications: true
+    enabled: false
+    mention_on_critical: false
+    channel_notifications: false
     
   dashboard:
     enabled: true
@@ -127,7 +180,7 @@ output:
 database:
   enabled: true
   host: "localhost"
-  port: 5433
+  port: 5432
   database: "pr_analysis"
   username: "postgres"
   password: "postgres"

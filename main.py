@@ -1,9 +1,15 @@
 """Main application entry point."""
 import time
 from datetime import datetime, timedelta
+from typing import Optional
+from uuid import UUID
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+from functools import wraps
+from sqlalchemy import text, desc
 from models.pr_event import PREvent
 from models.feedback import FeedbackFormatter
+from models.database import PRAnalysis
 from agents.dispatcher import AgentDispatcher
 from agents.auto_merge_agent import AutoMergeAgent
 from services.github_service import GitHubService
@@ -11,6 +17,7 @@ from services.slack_service import SlackService
 from services.dashboard_service import DashboardService
 from services.database_service import DatabaseService
 from services.analytics_service import AnalyticsService
+from services.auth_service import AuthService
 from utils.logger import logger
 from utils.config import config
 
@@ -20,19 +27,19 @@ ERROR_DB_SERVICE_UNAVAILABLE = 'Database service not available'
 ERROR_ANALYTICS_AGENT_UNAVAILABLE = 'Analytics Processing Agent not available'
 ERROR_REQUEST_BODY_REQUIRED = 'Request body is required'
 ERROR_MISSING_REPO_PR = 'Missing required fields: repository and pr_number'
+ERROR_AUTH_SERVICE_UNAVAILABLE = 'Authentication service not available'
+ERROR_EMAIL_REQUIRED = 'Email is required in request body'
+
+# Config keys
+CONFIG_OUTPUT_SLACK_ENABLED = 'output.slack.enabled'
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # Enable CORS for all API routes
 
-# Initialize components
-dispatcher = AgentDispatcher()
-github_service = GitHubService()
-slack_service = SlackService()
-dashboard_service = DashboardService()
-auto_merge_agent = AutoMergeAgent()
-
-# Initialize database services if enabled
+# Initialize database services first (needed by dispatcher for RAG)
 db_service = None
 analytics_service = None
+auth_service = None
 db_persistence_agent = None
 analytics_processing_agent = None
 
@@ -40,6 +47,7 @@ if config.get('database.enabled', False):
     try:
         db_service = DatabaseService()
         analytics_service = AnalyticsService(db_service)
+        auth_service = AuthService(db_service)
         
         # Initialize specialized agents
         from agents.database_persistence_agent import DatabasePersistenceAgent
@@ -53,6 +61,28 @@ if config.get('database.enabled', False):
         logger.error("Failed to initialize database services", error=str(e))
         logger.warning("Running without database persistence")
 
+# Initialize components (after db_service for RAG support)
+dispatcher = AgentDispatcher(db_service=db_service)
+github_service = GitHubService()
+slack_service = SlackService()
+dashboard_service = DashboardService()
+auto_merge_agent = AutoMergeAgent()
+
+# Initialize PR Comment Agent
+pr_comment_agent = None
+if config.get('pr_comments.enabled', False):
+    try:
+        from agents.pr_comment_agent import PRCommentAgent
+        pr_comment_agent = PRCommentAgent(
+            github_service=github_service,
+            db_service=db_service,
+            config=config.get('pr_comments', {})
+        )
+        logger.info("PR Comment Agent initialized successfully")
+    except Exception as e:
+        logger.error("Failed to initialize PR Comment Agent", error=str(e))
+        logger.warning("Running without automated PR comments")
+
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -64,6 +94,571 @@ def health():
     })
 
 
+# ============================================================================
+# AUTHENTICATION MIDDLEWARE
+# ============================================================================
+
+def require_auth(f):
+    """
+    Decorator to require authentication for an endpoint.
+    Validates JWT token from Authorization header.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not auth_service:
+            return jsonify({'error': ERROR_AUTH_SERVICE_UNAVAILABLE}), 503
+        
+        # Get token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return jsonify({'error': 'Authorization header required'}), 401
+        
+        # Extract token (format: "Bearer <token>")
+        parts = auth_header.split()
+        if len(parts) != 2 or parts[0].lower() != 'bearer':
+            return jsonify({'error': 'Invalid authorization header format. Use: Bearer <token>'}), 401
+        
+        token = parts[1]
+        
+        # Validate token and session
+        is_valid, user_data = auth_service.validate_session(token)
+        if not is_valid:
+            return jsonify({'error': 'Invalid or expired token. Please login again.'}), 401
+        
+        # Add user data to request context
+        request.current_user = user_data
+        
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+
+# ============================================================================
+# AUTHENTICATION ENDPOINTS
+# ============================================================================
+
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    """
+    Register a new user.
+    
+    Request Body:
+    {
+        "username": "john_doe",
+        "email": "john@example.com",
+        "password": "securepassword123",
+        "full_name": "John Doe"  // optional
+    }
+    
+    Response:
+    {
+        "success": true,
+        "message": "User registered successfully",
+        "user": {
+            "user_id": 1,
+            "username": "john_doe",
+            "email": "john@example.com",
+            "full_name": "John Doe",
+            "created_at": "2025-12-21T10:30:00"
+        }
+    }
+    """
+    if not auth_service:
+        return jsonify({'error': ERROR_AUTH_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+        
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
+        full_name = data.get('full_name')
+        
+        # Register user
+        success, message, user_data = auth_service.register_user(
+            username=username,
+            email=email,
+            password=password,
+            full_name=full_name
+        )
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': message,
+                'user': user_data
+            }), 201
+        else:
+            return jsonify({
+                'success': False,
+                'error': message
+            }), 400
+            
+    except Exception as e:
+        logger.error("Registration error", error=str(e))
+        return jsonify({'error': 'Registration failed'}), 500
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    """
+    Login a user and create a session.
+    
+    Request Body:
+    {
+        "email": "john@example.com",
+        "password": "securepassword123"
+    }
+    
+    Response:
+    {
+        "success": true,
+        "message": "Login successful",
+        "session": {
+            "token": "eyJhbGciOiJIUzI1NiIs...",
+            "user_id": 1,
+            "username": "john_doe",
+            "email": "john@example.com",
+            "full_name": "John Doe",
+            "expires_at": "2025-12-22T10:30:00",
+            "session_id": 123
+        }
+    }
+    """
+    if not auth_service:
+        return jsonify({'error': ERROR_AUTH_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+        
+        email = data.get('email')
+        password = data.get('password')
+        
+        if not email or not password:
+            return jsonify({'error': 'Email and password are required'}), 400
+        
+        # Get client information
+        ip_address = request.remote_addr
+        user_agent = request.headers.get('User-Agent')
+        
+        # Login user
+        success, message, session_data = auth_service.login_user(
+            email=email,
+            password=password,
+            ip_address=ip_address,
+            user_agent=user_agent
+        )
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': message,
+                'session': session_data
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': message
+            }), 401
+            
+    except Exception as e:
+        logger.error("Login error", error=str(e))
+        return jsonify({'error': 'Login failed'}), 500
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+@require_auth
+def logout():
+    """
+    Logout a user and invalidate their session.
+    
+    Headers:
+        Authorization: Bearer <token>
+    
+    Response:
+    {
+        "success": true,
+        "message": "Logout successful"
+    }
+    """
+    if not auth_service:
+        return jsonify({'error': ERROR_AUTH_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        # Get token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        token = auth_header.split()[1]
+        
+        # Logout user
+        success, message = auth_service.logout_user(token)
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': message
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': message
+            }), 400
+            
+    except Exception as e:
+        logger.error("Logout error", error=str(e))
+        return jsonify({'error': 'Logout failed'}), 500
+
+
+@app.route('/api/auth/validate', methods=['GET'])
+@require_auth
+def validate_token():
+    """
+    Validate current JWT token and get user information.
+    
+    Headers:
+        Authorization: Bearer <token>
+    
+    Response:
+    {
+        "valid": true,
+        "user": {
+            "user_id": 1,
+            "username": "john_doe",
+            "email": "john@example.com",
+            "full_name": "John Doe",
+            "is_admin": false
+        }
+    }
+    """
+    return jsonify({
+        'valid': True,
+        'user': request.current_user
+    }), 200
+
+
+@app.route('/api/auth/sessions', methods=['GET'])
+@require_auth
+def get_user_sessions():
+    """
+    Get all active sessions for the current user.
+    
+    Headers:
+        Authorization: Bearer <token>
+    
+    Response:
+    {
+        "sessions": [
+            {
+                "session_id": 123,
+                "created_at": "2025-12-21T10:30:00",
+                "expires_at": "2025-12-22T10:30:00",
+                "last_activity": "2025-12-21T15:45:00",
+                "ip_address": "192.168.1.100",
+                "user_agent": "Mozilla/5.0..."
+            }
+        ]
+    }
+    """
+    if not auth_service:
+        return jsonify({'error': ERROR_AUTH_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        user_id = UUID(request.current_user['user_id'])  # Convert string back to UUID
+        sessions = auth_service.get_user_active_sessions(user_id)
+        
+        return jsonify({
+            'sessions': sessions
+        }), 200
+        
+    except Exception as e:
+        logger.error("Error getting user sessions", error=str(e))
+        return jsonify({'error': 'Failed to get sessions'}), 500
+
+
+# ============================================================================
+# PR ANALYSIS ENDPOINTS (Original endpoints below)
+# ============================================================================
+
+def _validate_analyze_request(data):
+    """Validate the analyze request and return repository and pr_number."""
+    if not data:
+        return None, None, jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+    
+    repository = data.get('repository')
+    pr_number = data.get('pr_number')
+    
+    if not repository or not pr_number:
+        return None, None, jsonify({'error': ERROR_MISSING_REPO_PR}), 400
+    
+    return repository, pr_number, None, None
+
+
+def _fetch_pr_event(repository, pr_number):
+    """Fetch PR details from GitHub and create PREvent object."""
+    from datetime import datetime
+    from models.pr_event import PRAuthor
+    
+    pr_details = github_service.get_pr_details(repository, pr_number)
+    
+    if not pr_details:
+        return None, jsonify({
+            'error': f'Could not fetch PR #{pr_number} from {repository}. Check repository name and PR number.'
+        }), 404
+    
+    pr_event = PREvent(
+        action='manual',
+        id=pr_details.get('id', 0),  # GitHub's unique PR ID
+        pr_number=pr_number,
+        pr_title=pr_details.get('title', ''),
+        pr_description=pr_details.get('body', ''),
+        pr_url=f"https://github.com/{repository}/pull/{pr_number}",
+        repository=repository,
+        repository_url=f"https://github.com/{repository}",
+        author=PRAuthor(
+            login=pr_details.get('user', {}).get('login', ''),
+            id=0,
+            avatar_url=''
+        ),
+        base_branch=pr_details.get('base', {}).get('ref', 'main'),
+        head_branch=pr_details.get('head', {}).get('ref', ''),
+        files=[],
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        is_draft=False
+    )
+    
+    pr_event.files = github_service.get_pr_files(repository, pr_number)
+    return (pr_event, pr_details), None, None
+
+
+def _build_response_data(pr_event, result):
+    """Build API response data from analysis result."""
+    critical_count = sum(1 for issue in result.issues if issue.severity == 'critical')
+    high_count = sum(1 for issue in result.issues if issue.severity == 'high')
+    medium_count = sum(1 for issue in result.issues if issue.severity == 'medium')
+    low_count = sum(1 for issue in result.issues if issue.severity == 'low')
+    
+    return {
+        'status': 'success',
+        'message': 'Analysis completed',
+        'pr_number': pr_event.pr_number,
+        'repository': pr_event.repository,
+        'agent_used': result.agent_name,
+        'success': result.success,
+        'execution_time': result.execution_time,
+        'issues_found': len(result.issues),
+        'critical_issues': critical_count,
+        'high_issues': high_count,
+        'medium_issues': medium_count,
+        'low_issues': low_count,
+        'issues': [
+            {
+                'file': issue.file,
+                'line': issue.line,
+                'column': issue.column,
+                'type': issue.type.value if hasattr(issue.type, 'value') else str(issue.type),
+                'severity': issue.severity.value if hasattr(issue.severity, 'value') else str(issue.severity),
+                'code': issue.code,
+                'message': issue.message,
+                'suggestion': issue.suggestion,
+                'metadata': issue.metadata
+            }
+            for issue in result.issues
+        ],
+        'metrics': result.metrics,
+        'agent_breakdown': result.metadata.get('agent_breakdown', {}) if result.metadata else {},
+        'error': result.error
+    }
+
+
+def _persist_analysis(pr_event, pr_details, result, data, response_data):
+    """Persist analysis to database using persistence agent."""
+    if not db_persistence_agent:
+        return
+    
+    try:
+        pr_data = {
+            'repository': pr_event.repository,
+            'pr_number': pr_event.pr_number,
+            'title': pr_details.get('title', ''),
+            'description': pr_details.get('body', ''),
+            'url': f"https://github.com/{pr_event.repository}/pull/{pr_event.pr_number}",
+            'author': {
+                'login': pr_details.get('user', {}).get('login', ''),
+                'email': pr_details.get('user', {}).get('email'),
+                'name': pr_details.get('user', {}).get('name'),
+                'id': pr_details.get('user', {}).get('id', 0)
+            },
+            'base_branch': pr_details.get('base', {}).get('ref', 'main'),
+            'head_branch': pr_details.get('head', {}).get('ref', ''),
+            'files_changed': len(pr_event.files),
+            'lines_added': sum(f.additions for f in pr_event.files),
+            'lines_deleted': sum(f.deletions for f in pr_event.files),
+            'is_draft': pr_details.get('draft', False),
+            'created_at': pr_details.get('created_at'),
+            'updated_at': pr_details.get('updated_at')
+        }
+        
+        # Get author email from multiple sources (in priority order):
+        # 1. Explicitly provided in request
+        # 2. From PR user object (GitHub API)
+        # 3. From PR commits (fallback)
+        author_email = data.get('author_email')
+        if not author_email:
+            author_email = pr_details.get('user', {}).get('email')
+        if not author_email:
+            # Try to extract from PR commits
+            try:
+                author_email = github_service.get_author_email_from_commits(
+                    pr_event.repository,
+                    pr_event.pr_number
+                )
+                if author_email:
+                    logger.info(
+                        "Extracted author email from commits",
+                        repository=pr_event.repository,
+                        pr_number=pr_event.pr_number,
+                        email=author_email
+                    )
+            except Exception as email_error:
+                logger.warning(
+                    "Failed to extract email from commits",
+                    error=str(email_error)
+                )
+
+        persistence_result = db_persistence_agent.persist_analysis(
+            pr_data=pr_data,
+            analysis_result=result,
+            author_email=author_email
+        )
+        
+        if persistence_result.get('success'):
+            logger.info(
+                "PR analysis persisted by Database Persistence Agent",
+                pr_analysis_id=persistence_result.get('pr_analysis_id'),
+                repository=pr_event.repository,
+                pr_number=pr_event.pr_number
+            )
+            response_data['database_id'] = persistence_result.get('pr_analysis_id')
+            return persistence_result
+    
+    except Exception as db_error:
+        logger.error(
+            "Database Persistence Agent failed",
+            error=str(db_error),
+            repository=pr_event.repository,
+            pr_number=pr_event.pr_number
+        )
+    return None
+
+
+def _get_head_sha_from_pr_details(pr_details: dict, repository: str, pr_number: int) -> Optional[str]:
+    """Extract head SHA from PR details or fetch if missing."""
+    # Try to get from pr_details
+    if 'head' in pr_details and 'sha' in pr_details['head']:
+        return pr_details['head']['sha']
+    
+    # If not found, try to fetch from GitHub
+    logger.warning(
+        "No head SHA found, attempting to fetch from GitHub",
+        repository=repository,
+        pr_number=pr_number
+    )
+    try:
+        pr_info = github_service.get_pr_details(repository, pr_number)
+        if pr_info and 'head' in pr_info and 'sha' in pr_info['head']:
+            head_sha = pr_info['head']['sha']
+            logger.info("Successfully fetched head SHA", head_sha=head_sha)
+            return head_sha
+    except Exception as fetch_error:
+        logger.error("Failed to fetch head SHA", error=str(fetch_error))
+    
+    return None
+
+
+def _handle_pr_comments_tracking(pr_event, result, pr_details, persistence_result, response_data, repository, pr_number):
+    """Handle tracking comments in database (update if exists, insert if new)."""
+    try:
+        head_sha = _get_head_sha_from_pr_details(pr_details, repository, pr_number)
+        
+        logger.info(
+            "Preparing to track PR comments in database",
+            repository=repository,
+            pr_number=pr_number,
+            head_sha=head_sha
+        )
+        
+        # Get pr_analysis_id from persistence result
+        pr_analysis_id = persistence_result.get('pr_analysis_id') if persistence_result else None
+        
+        # Track comments in database (post_comments=False means don't post to GitHub)
+        comment_result = pr_comment_agent.post_analysis_comments(
+            pr_event=pr_event,
+            agent_result=result,
+            commit_sha=head_sha,
+            pr_analysis_id=pr_analysis_id
+        )
+        
+        response_data['comments_tracked'] = comment_result
+        logger.info(
+            "Tracked PR comments in database",
+            repository=repository,
+            pr_number=pr_number,
+            summary_tracked=comment_result.get('summary_posted'),  # Note: 'posted' flag still used internally
+            inline_count=comment_result.get('inline_comments_posted')
+        )
+        
+    except Exception as comment_error:
+        logger.error(
+            "Failed to track PR comments",
+            error=str(comment_error),
+            repository=repository,
+            pr_number=pr_number
+        )
+        response_data['comments_error'] = str(comment_error)
+
+
+def _handle_slack_notifications(pr_event, result, repository, pr_number, response_data):
+    """Handle sending Slack notifications."""
+    if not config.get(CONFIG_OUTPUT_SLACK_ENABLED):
+        return
+    
+    try:
+        slack_message = format_slack_message(pr_event, result)
+        slack_service.send_pr_notification(slack_message)
+        logger.info(
+            "Sent Slack notification",
+            repository=repository,
+            pr_number=pr_number
+        )
+        
+        # Send critical alert if needed
+        if result.critical_count > 0 and config.get('output.slack.mention_on_critical'):
+            slack_service.send_critical_alert(
+                pr_event.repository,
+                pr_event.pr_number,
+                pr_event.pr_url,
+                result.critical_count
+            )
+            logger.info(
+                "Sent Slack critical alert",
+                repository=repository,
+                pr_number=pr_number,
+                critical_count=result.critical_count
+            )
+    except Exception as slack_error:
+        logger.error(
+            "Failed to send Slack notification",
+            error=str(slack_error),
+            repository=repository,
+            pr_number=pr_number
+        )
+        response_data['slack_error'] = str(slack_error)
+
+
 @app.route('/api/analyze', methods=['POST'])
 def analyze_pr():
     """
@@ -73,24 +668,29 @@ def analyze_pr():
     {
         "repository": "owner/repo",
         "pr_number": 123,
-        "agent_type": "security"  // optional: static_analysis, security, code_quality, context
+        "agent_type": "security",  // optional: static_analysis, security, code_quality, context
+        "author_email": "user@example.com"  // optional: override author email for tracking
     }
     
     The system will automatically fetch PR details from GitHub.
+    If author_email is provided, it will be used for tracking the PR.
+    Otherwise, the system will try to get email from GitHub or git commits.
+    
+    The system will:
+    - Always analyze the PR
+    - Always save comments to database
+    - Update existing comments if they already exist in database
+    - Never post comments to GitHub (comments stored locally only)
     """
     try:
         data = request.json
         
-        if not data:
-            return jsonify({'error': ERROR_REQUEST_BODY_REQUIRED}), 400
+        # Validate request
+        repository, pr_number, error_response, error_code = _validate_analyze_request(data)
+        if error_response:
+            return error_response, error_code
         
-        # Extract PR information
-        repository = data.get('repository')
-        pr_number = data.get('pr_number')
-        agent_type = data.get('agent_type')  # Optional
-        
-        if not repository or not pr_number:
-            return jsonify({'error': ERROR_MISSING_REPO_PR}), 400
+        agent_type = data.get('agent_type')
         
         logger.info(
             "Received PR analysis request",
@@ -99,142 +699,30 @@ def analyze_pr():
             requested_agent=agent_type
         )
         
-        # Fetch PR details from GitHub automatically
+        # Fetch PR details and create PR event
         logger.info("Fetching PR details from GitHub...")
-        pr_details = github_service.get_pr_details(repository, pr_number)
+        pr_data_tuple, error_response, error_code = _fetch_pr_event(repository, pr_number)
+        if error_response:
+            return error_response, error_code
         
-        if not pr_details:
-            return jsonify({
-                'error': f'Could not fetch PR #{pr_number} from {repository}. Check repository name and PR number.'
-            }), 404
+        pr_event, pr_details = pr_data_tuple
         
-        # Create PR event object with fetched details
-        from datetime import datetime
-        from models.pr_event import PRAuthor
-        
-        pr_event = PREvent(
-            action='manual',
-            pr_number=pr_number,
-            pr_title=pr_details.get('title', ''),
-            pr_description=pr_details.get('body', ''),
-            pr_url=f"https://github.com/{repository}/pull/{pr_number}",
-            repository=repository,
-            repository_url=f"https://github.com/{repository}",
-            author=PRAuthor(
-                login=pr_details.get('user', {}).get('login', ''),
-                id=0,
-                avatar_url=''
-            ),
-            base_branch=pr_details.get('base', {}).get('ref', 'main'),
-            head_branch=pr_details.get('head', {}).get('ref', ''),
-            files=[],
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            is_draft=False
-        )
-        
-        # Get PR files from GitHub
-        pr_event.files = github_service.get_pr_files(repository, pr_number)
-        
-        # Dispatch to agent
+        # Dispatch to agent (always analyze)
         result = dispatcher.dispatch(pr_event, agent_type)
         
-        # Skip feedback for now - just return response
-        # send_feedback(pr_event, result)
+        # Build response
+        response_data = _build_response_data(pr_event, result)
         
-        # Count issues by severity
-        critical_count = sum(1 for issue in result.issues if issue.severity == 'critical')
-        high_count = sum(1 for issue in result.issues if issue.severity == 'high')
-        medium_count = sum(1 for issue in result.issues if issue.severity == 'medium')
-        low_count = sum(1 for issue in result.issues if issue.severity == 'low')
+        # Persist to database
+        persistence_result = _persist_analysis(pr_event, pr_details, result, data, response_data)
         
-        # Prepare response
-        response_data = {
-            'status': 'success',
-            'message': 'Analysis completed',
-            'pr_number': pr_number,
-            'repository': repository,
-            'agent_used': result.agent_name,
-            'success': result.success,
-            'execution_time': result.execution_time,
-            'issues_found': len(result.issues),
-            'critical_issues': critical_count,
-            'high_issues': high_count,
-            'medium_issues': medium_count,
-            'low_issues': low_count,
-            'issues': [
-                {
-                    'file': issue.file,
-                    'line': issue.line,
-                    'column': issue.column,
-                    'type': issue.type.value if hasattr(issue.type, 'value') else str(issue.type),
-                    'severity': issue.severity.value if hasattr(issue.severity, 'value') else str(issue.severity),
-                    'code': issue.code,
-                    'message': issue.message,
-                    'suggestion': issue.suggestion,
-                    'metadata': issue.metadata
-                }
-                for issue in result.issues
-            ],
-            'metrics': result.metrics,
-            'agent_breakdown': result.metadata.get('agent_breakdown', {}) if result.metadata else {},
-            'error': result.error
-        }
+        # Always track comments in database (update if exists, insert if new)
+        if pr_comment_agent:
+            _handle_pr_comments_tracking(pr_event, result, pr_details, persistence_result, 
+                                       response_data, repository, pr_number)
         
-        # Save to database using persistence agent if enabled
-        persistence_result = None
-        if db_persistence_agent:
-            try:
-                # Prepare PR data for database
-                pr_data = {
-                    'repository': repository,
-                    'pr_number': pr_number,
-                    'title': pr_details.get('title', ''),
-                    'description': pr_details.get('body', ''),
-                    'url': f"https://github.com/{repository}/pull/{pr_number}",
-                    'author': {
-                        'login': pr_details.get('user', {}).get('login', ''),
-                        'email': pr_details.get('user', {}).get('email'),
-                        'name': pr_details.get('user', {}).get('name'),
-                        'id': pr_details.get('user', {}).get('id', 0)
-                    },
-                    'base_branch': pr_details.get('base', {}).get('ref', 'main'),
-                    'head_branch': pr_details.get('head', {}).get('ref', ''),
-                    'files_changed': len(pr_event.files),
-                    'lines_added': sum(f.additions for f in pr_event.files),
-                    'lines_deleted': sum(f.deletions for f in pr_event.files),
-                    'is_draft': pr_details.get('draft', False),
-                    'created_at': pr_details.get('created_at'),
-                    'updated_at': pr_details.get('updated_at')
-                }
-                
-                # Get author email from additional field if provided
-                author_email = data.get('author_email')
-                
-                # Use persistence agent to save
-                persistence_result = db_persistence_agent.persist_analysis(
-                    pr_data=pr_data,
-                    analysis_result=result,
-                    author_email=author_email
-                )
-                
-                if persistence_result.get('success'):
-                    logger.info(
-                        "PR analysis persisted by Database Persistence Agent",
-                        pr_analysis_id=persistence_result.get('pr_analysis_id'),
-                        repository=repository,
-                        pr_number=pr_number
-                    )
-                    response_data['database_id'] = persistence_result.get('pr_analysis_id')
-                
-            except Exception as db_error:
-                logger.error(
-                    "Database Persistence Agent failed",
-                    error=str(db_error),
-                    repository=repository,
-                    pr_number=pr_number
-                )
-                # Continue without failing the request
+        # Send Slack Notifications
+        _handle_slack_notifications(pr_event, result, repository, pr_number, response_data)
         
         return jsonify(response_data), 200
         
@@ -372,7 +860,7 @@ def send_feedback(pr_event: PREvent, result):
                 )
     
     # Slack Notifications
-    if config.get('output.slack.enabled'):
+    if config.get(CONFIG_OUTPUT_SLACK_ENABLED):
         slack_message = format_slack_message(pr_event, result)
         slack_service.send_pr_notification(slack_message)
         
@@ -513,17 +1001,27 @@ def get_user_insights(author_login: str):
         return jsonify({'error': 'Failed to generate insights'}), 500
 
 
-@app.route('/api/dashboard/user/<author_login>/statistics', methods=['GET'])
-def get_user_statistics(author_login: str):
-    """Get user statistics summary."""
+@app.route('/api/dashboard/user/<author_identifier>/statistics', methods=['GET'])
+def get_user_statistics(author_identifier: str):
+    """
+    Get user statistics summary.
+    Accepts either author_login (username) or email address.
+    """
     if not db_service:
         return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
     
     try:
-        user_stats = db_service.get_user_statistics(author_login)
-        
-        if not user_stats:
-            return jsonify({'error': 'User not found'}), 404
+        # Check if author_identifier is an email (contains @)
+        if '@' in author_identifier:
+            # It's an email - use the dedicated email method
+            user_stats = db_service.get_user_statistics_by_email(author_identifier)
+            if not user_stats:
+                return jsonify({'error': f'No user found with email: {author_identifier}'}), 404
+        else:
+            # It's a username
+            user_stats = db_service.get_user_statistics(author_identifier)
+            if not user_stats:
+                return jsonify({'error': 'User not found'}), 404
         
         return jsonify({
             'author_login': user_stats.author_login,
@@ -543,7 +1041,22 @@ def get_user_statistics(author_login: str):
             'trends': {
                 'quality': user_stats.quality_trend,
                 'security': user_stats.security_trend,
-                'coverage': user_stats.coverage_trend
+                'coverage': user_stats.coverage_trend,
+                'rag_risk': user_stats.rag_risk_trend,
+                'rag_novelty': user_stats.rag_novelty_trend
+            },
+            # RAG Metrics
+            'rag_metrics': {
+                'total_insights': user_stats.total_rag_insights,
+                'avg_risk_score': user_stats.avg_rag_risk_score,
+                'avg_novelty_score': user_stats.avg_rag_novelty_score,
+                'total_similar_prs_referenced': user_stats.total_similar_prs_referenced,
+                'total_recommendations': user_stats.total_rag_recommendations,
+                'total_patterns_identified': user_stats.total_patterns_identified,
+                'high_risk_prs_count': user_stats.high_risk_prs_count,
+                'novel_prs_count': user_stats.novel_prs_count,
+                'most_common_patterns': user_stats.most_common_patterns,
+                'learning_velocity': user_stats.learning_velocity
             },
             'common_issues': user_stats.common_issues,
             'improvement_areas': user_stats.improvement_areas,
@@ -634,49 +1147,121 @@ def get_pr_analysis(repository: str, pr_number: int):
         return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
     
     try:
-        pr_analysis = db_service.get_pr_analysis(repository, pr_number)
-        
-        if not pr_analysis:
-            return jsonify({'error': 'PR analysis not found'}), 404
-        
-        return jsonify({
-            'id': pr_analysis.id,
-            'repository': pr_analysis.repository,
-            'pr_number': pr_analysis.pr_number,
-            'pr_title': pr_analysis.pr_title,
-            'pr_url': pr_analysis.pr_url,
-            'author_login': pr_analysis.author_login,
-            'author_email': pr_analysis.author_email,
-            'total_issues': pr_analysis.total_issues,
-            'severity_distribution': {
-                'critical': pr_analysis.critical_issues,
-                'high': pr_analysis.high_issues,
-                'medium': pr_analysis.medium_issues,
-                'low': pr_analysis.low_issues
-            },
-            'agent_breakdown': {
-                'static_analysis': pr_analysis.static_analysis_issues,
-                'security': pr_analysis.security_issues,
-                'code_quality': pr_analysis.code_quality_issues,
-                'context': pr_analysis.context_issues,
-                'coverage': pr_analysis.coverage_issues
-            },
-            'scores': {
-                'overall_quality': pr_analysis.overall_quality_score,
-                'security': pr_analysis.security_score,
-                'maintainability': pr_analysis.maintainability_score
-            },
-            'coverage_metrics': {
-                'estimated_coverage': pr_analysis.estimated_coverage,
-                'test_to_code_ratio': pr_analysis.test_to_code_ratio,
-                'complexity_score': pr_analysis.complexity_score
-            },
-            'analyzed_at': pr_analysis.analyzed_at.isoformat(),
-            'analysis_duration_ms': pr_analysis.analysis_duration_ms
-        }), 200
+        with db_service.get_session() as session:
+            pr_analysis = session.query(PRAnalysis).filter_by(
+                repository=repository,
+                pr_number=pr_number
+            ).order_by(desc(PRAnalysis.analyzed_at)).first()
+            
+            if not pr_analysis:
+                return jsonify({'error': 'PR analysis not found'}), 404
+            
+            result = _build_pr_analysis_response(pr_analysis)
+            return jsonify(result), 200
     except Exception as e:
         logger.error("Failed to get PR analysis", error=str(e), repository=repository, pr_number=pr_number)
         return jsonify({'error': 'Failed to retrieve analysis'}), 500
+
+
+def _build_pr_analysis_response(pr_analysis: PRAnalysis) -> dict:
+    """Build PR analysis response dictionary."""
+    result = {
+        'id': pr_analysis.id,
+        'repository': pr_analysis.repository,
+        'pr_number': pr_analysis.pr_number,
+        'pr_title': pr_analysis.pr_title,
+        'pr_url': pr_analysis.pr_url,
+        'author_login': pr_analysis.author_login,
+        'author_email': pr_analysis.author_email,
+        'total_issues': pr_analysis.total_issues,
+        'severity_distribution': _get_severity_distribution(pr_analysis),
+        'agent_breakdown': _get_agent_breakdown(pr_analysis),
+        'scores': _get_scores(pr_analysis),
+        'coverage_metrics': _get_coverage_metrics(pr_analysis),
+        'analyzed_at': pr_analysis.analyzed_at.isoformat(),
+        'analysis_duration_ms': pr_analysis.analysis_duration_ms
+    }
+    
+    # Add RAG insights if available
+    result['rag_insights'] = _get_rag_insights_for_response(pr_analysis)
+    
+    return result
+
+
+def _get_severity_distribution(pr_analysis: PRAnalysis) -> dict:
+    """Extract severity distribution from PR analysis."""
+    return {
+        'critical': pr_analysis.critical_issues,
+        'high': pr_analysis.high_issues,
+        'medium': pr_analysis.medium_issues,
+        'low': pr_analysis.low_issues
+    }
+
+
+def _get_agent_breakdown(pr_analysis: PRAnalysis) -> dict:
+    """Extract agent breakdown from PR analysis."""
+    return {
+        'static_analysis': pr_analysis.static_analysis_issues,
+        'security': pr_analysis.security_issues,
+        'code_quality': pr_analysis.code_quality_issues,
+        'context': pr_analysis.context_issues,
+        'coverage': pr_analysis.coverage_issues
+    }
+
+
+def _get_scores(pr_analysis: PRAnalysis) -> dict:
+    """Extract quality scores from PR analysis."""
+    return {
+        'overall_quality': pr_analysis.overall_quality_score,
+        'security': pr_analysis.security_score,
+        'maintainability': pr_analysis.maintainability_score
+    }
+
+
+def _get_coverage_metrics(pr_analysis: PRAnalysis) -> dict:
+    """Extract coverage metrics from PR analysis."""
+    return {
+        'estimated_coverage': pr_analysis.estimated_coverage,
+        'test_to_code_ratio': pr_analysis.test_to_code_ratio,
+        'complexity_score': pr_analysis.complexity_score
+    }
+
+
+def _get_rag_insights_for_response(pr_analysis: PRAnalysis) -> Optional[dict]:
+    """Get RAG insights formatted for API response."""
+    if not pr_analysis.has_rag_insights and not pr_analysis.rag_insights:
+        return None
+    
+    rag_insights_data = pr_analysis.rag_insights or {}
+    summary = _generate_summary_from_rag_data(rag_insights_data)
+    
+    return {
+        'has_insights': pr_analysis.has_rag_insights or bool(pr_analysis.rag_insights),
+        'risk_score': pr_analysis.rag_risk_score,
+        'novelty_score': pr_analysis.rag_novelty_score,
+        'summary': summary,
+        'insights': rag_insights_data
+    }
+
+
+def _generate_summary_from_rag_data(rag_insights_data: dict) -> str:
+    """Generate summary from RAG insights full_text if not present."""
+    summary = rag_insights_data.get('summary')
+    if not summary and 'full_text' in rag_insights_data:
+        full_text = rag_insights_data['full_text']
+        if full_text:
+            summary = _extract_summary_from_text(full_text)
+    return summary
+
+
+def _extract_summary_from_text(full_text: str) -> str:
+    """Extract summary from full text by finding first substantial line."""
+    lines = full_text.split('\n')
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith('#') and len(line) > 20:
+            return line
+    return full_text[:200].strip() + '...' if full_text else ''
 
 
 @app.route('/api/dashboard/init-db', methods=['POST'])
@@ -759,19 +1344,100 @@ def analyze_user_over_time(author_login: str):
         return jsonify({'error': 'Failed to generate analysis'}), 500
 
 
-@app.route('/api/analytics/user/<author_login>/summary', methods=['GET'])
-def get_user_analytics_summary(author_login: str):
+def _determine_quality_level(quality_score):
+    """Determine quality level and description from score."""
+    if quality_score >= 90:
+        return "excellent", "outstanding"
+    elif quality_score >= 80:
+        return "very good", "strong"
+    elif quality_score >= 70:
+        return "good", "solid"
+    elif quality_score >= 60:
+        return "fair", "moderate"
+    else:
+        return "needs improvement", "developing"
+
+
+def _determine_security_description(security_score):
+    """Determine security description from score."""
+    if security_score >= 95:
+        return "exemplary security practices"
+    elif security_score >= 85:
+        return "strong security standards"
+    elif security_score >= 75:
+        return "good security awareness"
+    else:
+        return "some security concerns"
+
+
+def _get_trend_text(quality_trend):
+    """Get trend description text."""
+    # Handle if quality_trend is a dict or other type
+    if isinstance(quality_trend, dict):
+        quality_trend = quality_trend.get('direction', 'stable')
+    quality_trend_str = str(quality_trend) if quality_trend else 'stable'
+    
+    if 'improv' in quality_trend_str.lower() or 'up' in quality_trend_str.lower():
+        return " Your code quality is showing positive improvement over time."
+    elif 'declin' in quality_trend_str.lower() or 'down' in quality_trend_str.lower():
+        return " Recent PRs show a declining quality trend that needs attention."
+    else:
+        return " Your code quality is maintaining a consistent level."
+
+
+def _build_summary_text(days, total_prs, quality_level, quality_desc, quality_score, 
+                        security_desc, security_score, avg_issues, trend_text, 
+                        best_practices, bad_practices):
+    """Build narrative summary text from analysis data."""
+    summary_text = f"""Over the past {days} days, you have contributed {total_prs} pull requests with {quality_level} overall quality (average score: {quality_score:.1f}/100). Your contributions demonstrate {quality_desc} coding practices with {security_desc} (security score: {security_score:.1f}/100).
+
+On average, your PRs contain {avg_issues:.1f} issues that are identified during code review.{trend_text}"""
+    
+    # Add best practices note
+    if best_practices and len(best_practices) > 0:
+        bp_names = ', '.join([bp if isinstance(bp, str) else bp.get('title', bp.get('category', 'N/A')) for bp in best_practices[:3]])
+        summary_text += f"\n\nYour strongest areas include: {bp_names}."
+    
+    # Add improvement areas
+    if bad_practices and len(bad_practices) > 0:
+        bad_names = ', '.join([bp if isinstance(bp, str) else bp.get('title', bp.get('category', 'N/A')) for bp in bad_practices[:3]])
+        summary_text += f"\n\nAreas for improvement: {bad_names}."
+    
+    return summary_text
+
+
+@app.route('/api/analytics/user/summary', methods=['POST'])
+def get_user_analytics_summary():
     """
     Get quick analytics summary for user (last 30 days by default).
     
-    Query Parameters:
-        - days: Number of days to analyze (default: 30)
+    Request Body:
+        - email: User email (required)
+        - days: Number of days to analyze (optional, default: 30)
     """
     if not analytics_processing_agent:
         return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
     
     try:
-        days = request.args.get('days', 30, type=int)
+        data = request.get_json()
+        if not data or not data.get('email'):
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
+        
+        email = data.get('email')
+        days = data.get('days', 30)
+        
+        # Get author_login from email
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            pr = session.query(PRAnalysis).filter_by(author_email=email).first()
+            if not pr:
+                return jsonify({
+                    'success': False,
+                    'error': f'No PRs found for email: {email}',
+                    'prs_analyzed': 0
+                }), 200
+            author_login = pr.author_login
+        
         start_date = datetime.now() - timedelta(days=days)
         
         analysis = analytics_processing_agent.analyze_user_over_time(
@@ -784,9 +1450,31 @@ def get_user_analytics_summary(author_login: str):
         if not analysis.get('success'):
             return jsonify(analysis), 200
         
-        # Return condensed summary
+        # Extract metrics
+        quality_score = analysis['code_scores'].get('overall_quality', {}).get('average', 0)
+        security_score = analysis['code_scores'].get('security', {}).get('average', 0)
+        total_prs = analysis['analysis_period']['total_prs']
+        avg_issues = analysis['quality_metrics']['avg_issues_per_pr']
+        
+        # Determine quality and security levels
+        quality_level, quality_desc = _determine_quality_level(quality_score)
+        security_desc = _determine_security_description(security_score)
+        
+        # Get trend text
+        quality_trend = analysis.get('trend_analysis', {}).get('quality', 'stable')
+        trend_text = _get_trend_text(quality_trend)
+        
+        # Build summary text
+        summary_text = _build_summary_text(
+            days, total_prs, quality_level, quality_desc, quality_score,
+            security_desc, security_score, avg_issues, trend_text,
+            analysis['best_practices'], analysis['bad_practices']
+        )
+        
+        # Return condensed summary with narrative text
         summary = {
             'author_login': author_login,
+            'author_email': email,
             'period_days': days,
             'total_prs': analysis['analysis_period']['total_prs'],
             'code_scores': analysis['code_scores'],
@@ -796,31 +1484,50 @@ def get_user_analytics_summary(author_login: str):
             },
             'top_best_practices': analysis['best_practices'][:3],
             'top_bad_practices': analysis['bad_practices'][:3],
-            'trends': analysis.get('trend_analysis', {})
+            'trends': analysis.get('trend_analysis', {}),
+            'summary_text': summary_text
         }
         
         return jsonify(summary), 200
         
     except Exception as e:
-        logger.error("Failed to get analytics summary", error=str(e), author=author_login)
+        logger.error("Failed to get analytics summary", error=str(e), email=email)
         return jsonify({'error': 'Failed to generate summary'}), 500
 
 
-@app.route('/api/analytics/user/<author_login>/recommendations', methods=['GET'])
-def get_user_recommendations(author_login: str):
+@app.route('/api/analytics/user/recommendations', methods=['POST'])
+def get_user_recommendations():
     """
     Get personalized improvement recommendations for user.
     
-    Query Parameters:
-        - days: Number of days to analyze (default: 90)
-        - priority: Filter by priority (critical, high, medium, low)
+    Request Body:
+        - email: User email (required)
+        - days: Number of days to analyze (optional, default: 90)
+        - priority: Filter by priority (optional: critical, high, medium, low)
     """
     if not analytics_processing_agent:
         return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
     
     try:
-        days = request.args.get('days', 90, type=int)
-        priority_filter = request.args.get('priority')
+        data = request.get_json()
+        if not data or not data.get('email'):
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
+        
+        email = data.get('email')
+        days = data.get('days', 90)
+        priority_filter = data.get('priority')
+        
+        # Get author_login from email
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            pr = session.query(PRAnalysis).filter_by(author_email=email).first()
+            if not pr:
+                return jsonify({
+                    'success': False,
+                    'error': f'No PRs found for email: {email}',
+                    'prs_analyzed': 0
+                }), 200
+            author_login = pr.author_login
         
         start_date = datetime.now() - timedelta(days=days)
         
@@ -842,29 +1549,49 @@ def get_user_recommendations(author_login: str):
         
         return jsonify({
             'author_login': author_login,
+            'author_email': email,
             'analysis_period_days': days,
             'total_recommendations': len(recommendations),
             'recommendations': recommendations
         }), 200
         
     except Exception as e:
-        logger.error("Failed to get recommendations", error=str(e), author=author_login)
+        logger.error("Failed to get recommendations", error=str(e), email=email)
         return jsonify({'error': 'Failed to generate recommendations'}), 500
 
 
-@app.route('/api/analytics/user/<author_login>/trends', methods=['GET'])
-def get_user_trends(author_login: str):
+@app.route('/api/analytics/user/trends', methods=['POST'])
+def get_user_trends():
     """
     Get quality trends for user over time.
     
-    Query Parameters:
-        - days: Number of days to analyze (default: 180)
+    Request Body:
+        - email: User email (required)
+        - days: Number of days to analyze (optional, default: 180)
     """
     if not analytics_processing_agent:
         return jsonify({'error': ERROR_ANALYTICS_AGENT_UNAVAILABLE}), 503
     
     try:
-        days = request.args.get('days', 180, type=int)
+        data = request.get_json()
+        if not data or not data.get('email'):
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
+        
+        email = data.get('email')
+        days = data.get('days', 180)
+        
+        # Get author_login from email
+        with db_service.get_session() as session:
+            from models.database import PRAnalysis
+            pr = session.query(PRAnalysis).filter_by(author_email=email).first()
+            if not pr:
+                return jsonify({
+                    'success': False,
+                    'error': f'No PRs found for email: {email}',
+                    'prs_analyzed': 0
+                }), 200
+            author_login = pr.author_login
+        
         start_date = datetime.now() - timedelta(days=days)
         
         analysis = analytics_processing_agent.analyze_user_over_time(
@@ -879,13 +1606,14 @@ def get_user_trends(author_login: str):
         
         return jsonify({
             'author_login': author_login,
+            'author_email': email,
             'analysis_period_days': days,
             'trend_analysis': analysis.get('trend_analysis', {}),
             'code_scores': analysis.get('code_scores', {})
         }), 200
         
     except Exception as e:
-        logger.error("Failed to get trends", error=str(e), author=author_login)
+        logger.error("Failed to get trends", error=str(e), email=email)
         return jsonify({'error': 'Failed to generate trends'}), 500
 
 
@@ -934,7 +1662,7 @@ def get_prs_by_email():
         data = request.json
         
         if not data or 'email' not in data:
-            return jsonify({'error': 'Email is required in request body'}), 400
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
         
         email = data.get('email')
         start_date_str = data.get('start_date')
@@ -992,7 +1720,13 @@ def get_prs_by_email():
                     'files_changed': pr.files_changed,
                     'lines_added': pr.lines_added,
                     'lines_deleted': pr.lines_deleted,
-                    'estimated_coverage': pr.estimated_coverage
+                    'estimated_coverage': pr.estimated_coverage,
+                    # RAG Metrics
+                    'has_rag_insights': pr.has_rag_insights,
+                    'rag_risk_score': pr.rag_risk_score,
+                    'rag_novelty_score': pr.rag_novelty_score,
+                    'rag_similar_prs_count': pr.rag_similar_prs_count,
+                    'rag_recommendations_count': pr.rag_recommendations_count
                 })
             
             return jsonify({
@@ -1009,6 +1743,166 @@ def get_prs_by_email():
     except Exception as e:
         logger.error("Failed to fetch PRs by email", error=str(e), email=email)
         return jsonify({'error': 'Failed to fetch PRs'}), 500
+
+
+def _fetch_rag_table_data(session, pr_id):
+    """Fetch RAG insights from database tables."""
+    rag_result = session.execute(
+        text("""
+            SELECT id, risk_score, novelty_score, complexity_assessment, 
+                   summary, recommendations, lessons_learned, 
+                   potential_pitfalls, best_practices_suggested,
+                   context_used, similar_prs_found, similar_prs_referenced,
+                   full_text
+            FROM rag_insights 
+            WHERE pr_analysis_id = :pr_id
+        """),
+        {'pr_id': pr_id}
+    ).fetchone()
+    return rag_result
+
+
+def _fetch_similar_prs(session, rag_insight_id):
+    """Fetch similar PR references."""
+    return session.execute(
+        text("""
+            SELECT referenced_pr_analysis_id, similarity_score, 
+                   similarity_type, lesson_extracted, pattern_identified
+            FROM rag_similar_pr_references 
+            WHERE rag_insight_id = :insight_id
+        """),
+        {'insight_id': rag_insight_id}
+    ).fetchall()
+
+
+def _fetch_rag_recommendations(session, rag_insight_id):
+    """Fetch RAG recommendations."""
+    return session.execute(
+        text("""
+            SELECT recommendation_type, priority, title, 
+                   description, reasoning
+            FROM rag_recommendations 
+            WHERE rag_insight_id = :insight_id
+        """),
+        {'insight_id': rag_insight_id}
+    ).fetchall()
+
+
+def _build_rag_insights_data(session, pr, rag_result, similar_prs_result, recommendations_result, rag_json):
+    """Build RAG insights data structure from table and JSON data."""
+    from models.database import PRAnalysis
+    
+    return {
+        'risk_score': rag_result[1] or pr.rag_risk_score,
+        'novelty_score': rag_result[2] or pr.rag_novelty_score,
+        'complexity_assessment': rag_result[3],
+        'full_text': rag_result[12] or rag_json.get('full_text', ''),
+        'summary': rag_result[4] or rag_json.get('summary', ''),
+        'recommendations': rag_result[5] or rag_json.get('recommendations', ''),
+        'lessons_learned': rag_result[6] or rag_json.get('lessons_learned', ''),
+        'potential_pitfalls': rag_result[7] or rag_json.get('potential_pitfalls', ''),
+        'best_practices_suggested': rag_result[8] or rag_json.get('best_practices', ''),
+        'context_used': rag_result[9] if rag_result[9] is not None else rag_json.get('context_used', False),
+        'similar_prs_found': rag_result[10] or rag_json.get('similar_prs_found', 0),
+        'similar_prs_referenced': rag_result[11] or rag_json.get('similar_prs_referenced', 0),
+        'generated_at': rag_json.get('generated_at'),
+        'similar_prs': [
+            {
+                'pr_number': session.query(PRAnalysis).get(ref[0]).pr_number if ref[0] and session.query(PRAnalysis).get(ref[0]) else None,
+                'similarity_score': ref[1],
+                'similarity_type': ref[2],
+                'lesson_extracted': ref[3],
+                'pattern_identified': ref[4]
+            } for ref in similar_prs_result
+        ],
+        'detailed_recommendations': [
+            {
+                'type': rec[0],
+                'priority': rec[1],
+                'title': rec[2],
+                'description': rec[3],
+                'reasoning': rec[4]
+            } for rec in recommendations_result
+        ]
+    }
+
+
+def _get_rag_insights(session, pr):
+    """Get RAG insights for a PR from database and JSON field."""
+    # Check if RAG insights exist (either flag is True OR JSON data exists)
+    if not pr.has_rag_insights and not pr.rag_insights:
+        return None
+    
+    try:
+        rag_json = pr.rag_insights or {}
+        rag_result = _fetch_rag_table_data(session, pr.id)
+        
+        if rag_result:
+            return _build_rag_from_table_data(session, pr, rag_result, rag_json)
+        else:
+            return _build_rag_from_json_data(pr, rag_json)
+            
+    except Exception as e:
+        logger.error(f"Error fetching RAG insights: {e}")
+        return _build_rag_fallback_data(pr)
+
+
+def _build_rag_from_table_data(session, pr, rag_result, rag_json):
+    """Build RAG insights from database table data."""
+    rag_insight_id = rag_result[0]
+    similar_prs_result = _fetch_similar_prs(session, rag_insight_id)
+    recommendations_result = _fetch_rag_recommendations(session, rag_insight_id)
+    
+    return _build_rag_insights_data(
+        session, pr, rag_result, similar_prs_result, 
+        recommendations_result, rag_json
+    )
+
+
+def _build_rag_from_json_data(pr, rag_json):
+    """Build RAG insights from JSON field."""
+    rag_insights_data = rag_json.copy()
+    rag_insights_data['risk_score'] = pr.rag_risk_score
+    rag_insights_data['novelty_score'] = pr.rag_novelty_score
+    
+    # Generate summary from full_text if needed
+    _add_summary_to_rag_data(rag_insights_data)
+    
+    return rag_insights_data
+
+
+def _build_rag_fallback_data(pr):
+    """Build RAG insights from fallback data when error occurs."""
+    if not pr.rag_insights:
+        return None
+    
+    rag_insights_data = pr.rag_insights.copy()
+    rag_insights_data['risk_score'] = pr.rag_risk_score
+    rag_insights_data['novelty_score'] = pr.rag_novelty_score
+    
+    # Generate summary from full_text if needed
+    _add_summary_to_rag_data(rag_insights_data)
+    
+    return rag_insights_data
+
+
+def _add_summary_to_rag_data(rag_insights_data):
+    """Add summary to RAG data if not present or empty."""
+    if 'full_text' in rag_insights_data and not rag_insights_data.get('summary'):
+        full_text = rag_insights_data['full_text']
+        if full_text:
+            summary = _extract_summary_from_full_text(full_text)
+            rag_insights_data['summary'] = summary
+
+
+def _extract_summary_from_full_text(full_text):
+    """Extract summary from full text by finding first substantial line."""
+    lines = full_text.split('\n')
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith('#') and len(line) > 20:
+            return line
+    return full_text[:200].strip() + '...' if full_text else ''
 
 
 @app.route('/api/prs/details', methods=['POST'])
@@ -1109,6 +2003,9 @@ def get_pr_details():
             # Get issues for this PR
             issues = session.query(PRIssue).filter_by(pr_analysis_id=pr.id).all()
             
+            # Get RAG insights if available
+            rag_insights_data = _get_rag_insights(session, pr)
+            
             # Format PR details
             pr_details = {
                 'pr_number': pr.pr_number,
@@ -1148,7 +2045,9 @@ def get_pr_details():
                     'complexity_score': pr.complexity_score,
                     'estimated_coverage': pr.estimated_coverage,
                     'test_to_code_ratio': pr.test_to_code_ratio
-                }
+                },
+                # RAG Insights
+                'rag_insights': rag_insights_data
             }
             
             # Format issues
@@ -1176,6 +2075,401 @@ def get_pr_details():
     except Exception as e:
         logger.error("Failed to fetch PR details", error=str(e), pr_number=pr_number)
         return jsonify({'error': 'Failed to fetch PR details'}), 500
+
+
+def _extract_code_context(file_content: dict, line_number: int, context_lines: int = 3) -> Optional[dict]:
+    """
+    Extract code context around a specific line from file content.
+    
+    Args:
+        file_content: File content dictionary with 'lines' array
+        line_number: Target line number
+        context_lines: Number of lines to include before and after
+        
+    Returns:
+        Code context dictionary or None
+    """
+    if not file_content or 'lines' not in file_content:
+        return None
+    
+    lines = file_content['lines']
+    total_lines = len(lines)
+    
+    # Calculate line range
+    start_line = max(1, line_number - context_lines)
+    end_line = min(total_lines, line_number + context_lines)
+    
+    # Extract lines
+    code_lines = []
+    for i in range(start_line - 1, end_line):
+        if i < len(lines):
+            code_lines.append({
+                'line_number': i + 1,
+                'content': lines[i],
+                'is_target': (i + 1) == line_number
+            })
+    
+    return {
+        'file_path': file_content.get('file_path'),
+        'target_line': line_number,
+        'start_line': start_line,
+        'end_line': end_line,
+        'lines': code_lines,
+        'total_lines': total_lines
+    }
+
+
+def _find_pr_by_number(session, pr_number: int, repository: Optional[str]):
+    """Find PR analysis by PR number and optionally repository."""
+    from models.database import PRAnalysis
+    
+    query = session.query(PRAnalysis).filter_by(pr_number=pr_number)
+    
+    if repository:
+        query = query.filter_by(repository=repository)
+    
+    return query.first()
+
+
+def _get_pr_comments_from_db(session, pr_analysis_id: int):
+    """Get all comments for a PR analysis from database."""
+    from models.database import PRComment
+    
+    return session.query(PRComment).filter_by(
+        pr_analysis_id=pr_analysis_id
+    ).order_by(PRComment.file_path, PRComment.line_number).all()
+
+
+def _format_comment_basic_info(comment) -> dict:
+    """Format basic comment information."""
+    return {
+        'id': comment.id,
+        'comment_type': comment.comment_type,
+        'file_path': comment.file_path,
+        'line_number': comment.line_number,
+        'commit_sha': comment.commit_sha,
+        'comment_body': comment.comment_body,
+        'comment_preview': comment.comment_preview,
+        'issue_severity': comment.issue_severity,
+        'issue_type': comment.issue_type,
+        'posted_successfully': comment.posted_successfully,
+        'review_event': comment.review_event,
+        'github_url': comment.github_url,
+        'reactions_count': comment.reactions_count,
+        'replies_count': comment.replies_count,
+        'was_edited': comment.was_edited,
+        'was_resolved': comment.was_resolved,
+        'resolved_at': comment.resolved_at.isoformat() if comment.resolved_at else None,
+        'posted_at': comment.posted_at.isoformat() if comment.posted_at else None,
+        'github_comment_id': comment.github_comment_id,
+        'github_review_id': comment.github_review_id
+    }
+
+
+def _add_code_context_if_requested(comment_dict: dict, comment, pr_repository: str, 
+                                    include_code: bool, file_cache: dict):
+    """Add code context to comment if requested and available."""
+    if not (include_code and github_service and comment.file_path and 
+            comment.line_number and comment.commit_sha):
+        return
+    
+    # Create cache key for this file at this commit
+    cache_key = f"{comment.commit_sha}:{comment.file_path}"
+    
+    # Get file content from cache or fetch it
+    if cache_key not in file_cache:
+        file_cache[cache_key] = github_service.get_file_content_at_commit(
+            repository=pr_repository,
+            file_path=comment.file_path,
+            commit_sha=comment.commit_sha
+        )
+    
+    # Extract lines around the comment line from cached content
+    file_content = file_cache[cache_key]
+    if file_content:
+        code_context = _extract_code_context(
+            file_content, 
+            comment.line_number, 
+            context_lines=3
+        )
+        if code_context:
+            comment_dict['code_context'] = code_context
+
+
+@app.route('/api/prs/comments', methods=['POST'])
+def get_pr_comments():
+    """
+    Get comments for a specific PR with code context.
+    
+    Request Body:
+    {
+        "pr_number": 123,
+        "repository": "owner/repo"  // optional
+    }
+    
+    Response:
+    {
+        "success": true,
+        "pr_number": 123,
+        "repository": "owner/repo",
+        "total_comments": 15,
+        "comments": [
+            {
+                "id": 1,
+                "comment_type": "inline",
+                "file_path": "src/main.py",
+                "line_number": 45,
+                "comment_body": "Consider using a more descriptive variable name",
+                "issue_severity": "medium",
+                "issue_type": "code_quality",
+                "posted_at": "2024-12-20T10:30:00Z",
+                "github_url": "https://github.com/...",
+                "reactions_count": 2,
+                "replies_count": 1,
+                "was_resolved": false,
+                "code_context": {
+                    "target_line": 45,
+                    "start_line": 42,
+                    "end_line": 48,
+                    "lines": [
+                        {"line_number": 42, "content": "def process():", "is_target": false},
+                        {"line_number": 43, "content": "    x = 10", "is_target": false},
+                        {"line_number": 44, "content": "    y = 20", "is_target": false},
+                        {"line_number": 45, "content": "    z = x + y", "is_target": true},
+                        ...
+                    ]
+                }
+            },
+            ...
+        ]
+    }
+    """
+    if not db_service:
+        return jsonify({'error': ERROR_DB_SERVICE_UNAVAILABLE}), 503
+    
+    try:
+        data = request.json
+        
+        if not data or 'pr_number' not in data:
+            return jsonify({'error': 'pr_number is required in request body'}), 400
+        
+        pr_number = data.get('pr_number')
+        repository = data.get('repository')
+        include_code = data.get('include_code', False)
+        
+        # Get PR and its comments from database
+        with db_service.get_session() as session:
+            pr = _find_pr_by_number(session, pr_number, repository)
+            
+            if not pr:
+                return jsonify({
+                    'error': 'PR not found',
+                    'pr_number': pr_number,
+                    'repository': repository
+                }), 404
+            
+            # Get comments for this PR
+            comments = _get_pr_comments_from_db(session, pr.id)
+            
+            # Format comments with optional code context
+            comments_list = []
+            file_cache = {}  # Cache for file contents to avoid redundant GitHub API calls
+            
+            for comment in comments:
+                comment_dict = _format_comment_basic_info(comment)
+                _add_code_context_if_requested(comment_dict, comment, pr.repository, 
+                                               include_code, file_cache)
+                comments_list.append(comment_dict)
+            
+            return jsonify({
+                'success': True,
+                'pr_number': pr.pr_number,
+                'repository': pr.repository,
+                'total_comments': len(comments_list),
+                'comments': comments_list
+            }), 200
+            
+    except Exception as e:
+        logger.error("Failed to fetch PR comments", error=str(e), pr_number=pr_number)
+        return jsonify({'error': 'Failed to fetch PR comments'}), 500
+
+
+@app.route('/api/slack/notify', methods=['POST'])
+def send_slack_notification():
+    """
+    Send a custom Slack notification.
+    
+    Request Body:
+    {
+        "type": "pr_reviewed" | "comment_posted",
+        "repository": "owner/repo",
+        "pr_number": 123,
+        "pr_url": "https://github.com/...",
+        "pr_title": "Fix bug",
+        "issues_found": 5,
+        "critical_count": 0,
+        "comment": {  // Optional, for comment_posted type
+            "file_path": "src/main.py",
+            "line_number": 45,
+            "severity": "medium",
+            "message": "Comment text..."
+        }
+    }
+    
+    Response:
+    {
+        "success": true,
+        "message": "Notification sent to Slack"
+    }
+    """
+    try:
+        data = request.json
+        
+        if not data:
+            return jsonify({'error': 'Request body is required'}), 400
+        
+        notification_type = data.get('type', 'pr_reviewed')
+        repository = data.get('repository')
+        pr_number = data.get('pr_number')
+        pr_url = data.get('pr_url')
+        
+        if not all([repository, pr_number, pr_url]):
+            return jsonify({'error': 'Missing required fields: repository, pr_number, pr_url'}), 400
+        
+        # Check if Slack is enabled
+        if not config.get(CONFIG_OUTPUT_SLACK_ENABLED):
+            return jsonify({'error': 'Slack notifications are disabled'}), 400
+        
+        success = False
+        
+        if notification_type == 'pr_reviewed':
+            # PR Review notification
+            pr_title = data.get('pr_title', f'PR #{pr_number}')
+            issues_found = data.get('issues_found', 0)
+            critical_count = data.get('critical_count', 0)
+            
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "✅ PR Review Complete"
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Repository:*\n{repository}"},
+                        {"type": "mrkdwn", "text": f"*PR:*\n#{pr_number}"}
+                    ]
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Title:*\n{pr_title}"},
+                        {"type": "mrkdwn", "text": f"*Issues Found:*\n{issues_found}"}
+                    ]
+                }
+            ]
+            
+            if critical_count > 0:
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"⚠️ *{critical_count} critical issue(s) found!*"
+                    }
+                })
+            
+            blocks.append({
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "View PR"},
+                        "url": pr_url,
+                        "style": "primary" if critical_count == 0 else "danger"
+                    }
+                ]
+            })
+            
+            success = slack_service.send_message(
+                text=f"✅ PR Review Complete: {repository} #{pr_number}",
+                blocks=blocks
+            )
+        
+        elif notification_type == 'comment_posted':
+            # Comment notification
+            comment = data.get('comment', {})
+            file_path = comment.get('file_path', 'Unknown file')
+            line_number = comment.get('line_number', 0)
+            severity = comment.get('severity', 'info')
+            message = comment.get('message', 'No message')
+            
+            severity_emoji = {
+                'critical': '🔴',
+                'high': '🟠',
+                'medium': '🟡',
+                'low': '🔵',
+                'info': 'ℹ️'
+            }.get(severity.lower(), 'ℹ️')
+            
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "💬 New Review Comment"
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Repository:*\n{repository}"},
+                        {"type": "mrkdwn", "text": f"*PR:*\n#{pr_number}"}
+                    ]
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*File:* `{file_path}` (Line {line_number})\n*Severity:* {severity_emoji} {severity.title()}\n\n_{message}_"
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "View Comment"},
+                            "url": pr_url
+                        }
+                    ]
+                }
+            ]
+            
+            success = slack_service.send_message(
+                text=f"💬 New Comment on PR #{pr_number}",
+                blocks=blocks
+            )
+        
+        else:
+            return jsonify({'error': f'Invalid notification type: {notification_type}'}), 400
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': 'Notification sent to Slack'
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to send notification to Slack'
+            }), 500
+    
+    except Exception as e:
+        logger.error("Failed to send Slack notification", error=str(e))
+        return jsonify({'error': 'Failed to send Slack notification'}), 500
 
 
 @app.route('/api/analytics/user', methods=['POST'])
@@ -1266,7 +2560,7 @@ def get_user_analytics():
         data = request.json
         
         if not data or 'email' not in data:
-            return jsonify({'error': 'Email is required in request body'}), 400
+            return jsonify({'error': ERROR_EMAIL_REQUIRED}), 400
         
         email = data.get('email')
         start_date_str = data.get('start_date')

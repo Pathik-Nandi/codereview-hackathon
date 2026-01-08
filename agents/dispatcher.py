@@ -12,13 +12,14 @@ class AgentDispatcher:
     Dispatches PR analysis to the main agent which internally runs all agents.
     """
     
-    def __init__(self):
+    def __init__(self, db_service=None):
         """Initialize the agent dispatcher with main agent."""
         self.logger = logger.bind(component="agent_dispatcher")
         
         # Initialize the main orchestrator agent
         # It will internally manage all specialized agents
-        self.main_agent = MainAgent(config.get('agents', {}))
+        # Pass db_service for RAG agent
+        self.main_agent = MainAgent(config.get('agents', {}), db_service=db_service)
         
         self.logger.info(
             "Agent dispatcher initialized with Main Orchestrator Agent"
@@ -67,7 +68,7 @@ class AgentDispatcher:
                     }
                     for issue in agent_data.get('issues', [])
                 ],
-                'metadata': agent_data.get('metadata', {})  # Include agent metrics for database
+                'metadata': {**agent_data.get('metadata', {}), **agent_data.get('metrics', {})}  # Include agent metrics/metadata for database
             }
         
         self.logger.info(
@@ -81,6 +82,34 @@ class AgentDispatcher:
         # Add serializable agent breakdown to result metadata
         result.metadata = result.metadata or {}
         result.metadata['agent_breakdown'] = serializable_breakdown
+        
+        # Extract RAG insights and add to main metadata for PR comment agent
+        for agent_name, agent_data in agent_breakdown.items():
+            if 'RAG' in agent_name or 'rag' in agent_name.lower():
+                rag_metadata = agent_data.get('metadata', {})
+                if rag_metadata:
+                    # Get nested rag_insights dictionary
+                    rag_insights_dict = rag_metadata.get('rag_insights', {})
+                    
+                    # Extract RAG-specific data for PR comment agent
+                    result.metadata['rag_insights'] = {
+                        'novelty_score': rag_metadata.get('novelty_score', 0),
+                        'risk_score': rag_metadata.get('risk_score', 0),
+                        'similar_prs_count': rag_metadata.get('similar_prs_found', 0),
+                        'recommendations': rag_insights_dict.get('recommendations', ''),
+                        'lessons_learned': rag_insights_dict.get('lessons_learned', ''),
+                        'potential_pitfalls': rag_insights_dict.get('potential_pitfalls', ''),
+                        'best_practices': rag_insights_dict.get('best_practices', ''),
+                        'learned_patterns': rag_metadata.get('patterns_identified', []),
+                        'similar_prs': rag_metadata.get('similar_prs', []),
+                        'full_text': rag_insights_dict.get('full_text', '')
+                    }
+                    self.logger.info(
+                        "RAG insights added to result metadata",
+                        similar_prs=rag_metadata.get('similar_prs_found', 0),
+                        has_recommendations=bool(rag_insights_dict.get('recommendations', '').strip()),
+                        patterns=len(rag_metadata.get('patterns_identified', []))
+                    )
         
         return result
     

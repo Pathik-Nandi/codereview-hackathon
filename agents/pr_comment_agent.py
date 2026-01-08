@@ -93,55 +93,171 @@ class PRCommentAgent:
             }
         """
         if not self.enabled:
-            self.logger.info("PR Comment Agent disabled")
-            return {
-                'summary_posted': False,
-                'inline_comments_posted': 0,
-                'success': False,
-                'message': 'Agent disabled'
-            }
-        
-        results = {
-            'summary_posted': False,
-            'inline_comments_posted': 0,
-            'success': True
-        }
+            return self._create_disabled_response()
         
         try:
-            # NOTE: Posting to GitHub is disabled. Comments are only tracked in database.
-            # This allows analysis without affecting the actual GitHub PR.
+            existing_summary = self.github_service.find_summary_comment(
+                pr_event.repository, 
+                pr_event.pr_number
+            )
             
-            # Generate inline comments for tracking
-            inline_comments = self._generate_inline_comments(agent_result)
-            results['inline_comments_posted'] = len(inline_comments)
+            results = self._initialize_results()
             
-            # Track comments in database (if enabled)
+            if not existing_summary:
+                results = self._post_comments_to_github(pr_event, agent_result, commit_sha, results)
+            else:
+                results = self._create_skipped_response(existing_summary)
+            
             if pr_analysis_id and self.track_in_database:
-                self._track_comments_in_database(
-                    pr_event=pr_event,
-                    pr_analysis_id=pr_analysis_id,
-                    agent_result=agent_result,
-                    summary_posted=True,  # Always track summary
-                    inline_comments=inline_comments,
-                    review_event=None,  # Not posting to GitHub
-                    commit_sha=commit_sha,
-                    github_comment_id=None,  # Not posted to GitHub
-                    github_review_id=None  # Not posted to GitHub
+                self._handle_database_tracking(
+                    pr_event, pr_analysis_id, agent_result, 
+                    commit_sha, results, existing_summary
                 )
-                results['summary_posted'] = True
             
             return results
             
         except Exception as e:
-            self.logger.error(
-                "Failed to post PR comments",
-                pr_number=pr_event.pr_number,
-                error=str(e),
-                exc_info=True
-            )
-            results['success'] = False
-            results['error'] = str(e)
-            return results
+            return self._create_error_response(e, pr_event)
+    
+    def _create_disabled_response(self) -> Dict[str, bool]:
+        """Create response when agent is disabled."""
+        self.logger.info("PR Comment Agent disabled")
+        return {
+            'summary_posted': False,
+            'inline_comments_posted': 0,
+            'success': False,
+            'message': 'Agent disabled'
+        }
+    
+    def _initialize_results(self) -> Dict[str, bool]:
+        """Initialize default results dictionary."""
+        return {
+            'summary_posted': False,
+            'inline_comments_posted': 0,
+            'success': True
+        }
+    
+    def _create_skipped_response(self, existing_summary: dict) -> Dict[str, bool]:
+        """Create response when comments already exist on GitHub."""
+        self.logger.info(
+            "Bot summary already exists on GitHub. Skipping duplicate posting.",
+            comment_id=existing_summary.get('id')
+        )
+        return {
+            'summary_posted': False,
+            'inline_comments_posted': 0,
+            'success': True,
+            'message': 'Comment already exists, skipped posting'
+        }
+    
+    def _create_error_response(self, error: Exception, pr_event: PREvent) -> Dict[str, bool]:
+        """Create response when an error occurs."""
+        self.logger.error(
+            "Failed to post PR comments",
+            pr_number=pr_event.pr_number,
+            error=str(error),
+            exc_info=True
+        )
+        return {
+            'summary_posted': False,
+            'inline_comments_posted': 0,
+            'success': False,
+            'error': str(error)
+        }
+    
+    def _post_comments_to_github(
+        self, 
+        pr_event: PREvent, 
+        agent_result: AgentResult, 
+        commit_sha: Optional[str],
+        results: Dict[str, bool]
+    ) -> Dict[str, bool]:
+        """Post comments to GitHub and update results."""
+        self.logger.info("No existing summary found. Proceeding to post comments to GitHub.")
+        
+        summary_response = None
+        review_response = None
+        
+        # 1. Post Inline Comments as Review (if enabled)
+        if self.post_inline_comments:
+            sha_to_use = self._determine_commit_sha(pr_event, commit_sha)
+            if sha_to_use:
+                review_response, inline_count, _ = self._post_inline_comments_as_review(
+                    pr_event, agent_result, sha_to_use
+                )
+                results['inline_comments_posted'] = inline_count
+            else:
+                self.logger.warning("Cannot post inline comments: commit SHA not found")
+        
+        # 2. Post Summary Comment (if enabled)
+        if self.post_summary:
+            summary_response = self._post_summary(pr_event, agent_result)
+            if summary_response:
+                results['summary_posted'] = True
+        
+        # Store responses for later use
+        results['_summary_response'] = summary_response
+        results['_review_response'] = review_response
+        
+        return results
+    
+    def _determine_commit_sha(self, pr_event: PREvent, commit_sha: Optional[str]) -> Optional[str]:
+        """Determine the commit SHA to use for inline comments."""
+        sha_to_use = commit_sha or pr_event.head_sha
+        if not sha_to_use and hasattr(pr_event, 'head'):
+            sha_to_use = pr_event.head.get('sha')
+        return sha_to_use
+    
+    def _handle_database_tracking(
+        self,
+        pr_event: PREvent,
+        pr_analysis_id: int,
+        agent_result: AgentResult,
+        commit_sha: Optional[str],
+        results: Dict[str, bool],
+        existing_summary: Optional[dict]
+    ):
+        """Handle tracking comments in database."""
+        tracked_inline = self._generate_inline_comments(agent_result)
+        
+        summary_response = results.get('_summary_response')
+        review_response = results.get('_review_response')
+        
+        github_comment_id = self._get_comment_id(summary_response, existing_summary)
+        github_review_id = str(review_response.get('id')) if review_response else None
+        review_event = review_response.get('state') if review_response else None
+        
+        self._track_comments_in_database(
+            pr_event=pr_event,
+            pr_analysis_id=pr_analysis_id,
+            agent_result=agent_result,
+            summary_posted=True,
+            inline_comments=tracked_inline,
+            review_event=review_event,
+            commit_sha=commit_sha,
+            github_comment_id=github_comment_id,
+            github_review_id=github_review_id
+        )
+        
+        results['summary_posted'] = True
+        if not results['inline_comments_posted']:
+            results['inline_comments_posted'] = len(tracked_inline)
+        
+        # Clean up internal keys
+        results.pop('_summary_response', None)
+        results.pop('_review_response', None)
+    
+    def _get_comment_id(
+        self, 
+        summary_response: Optional[dict], 
+        existing_summary: Optional[dict]
+    ) -> Optional[str]:
+        """Get GitHub comment ID from responses."""
+        if summary_response:
+            return str(summary_response.get('id'))
+        if existing_summary:
+            return str(existing_summary.get('id'))
+        return None
     
     def _generate_inline_comments(self, agent_result: AgentResult) -> List[Dict]:
         """
@@ -197,7 +313,7 @@ class PRCommentAgent:
         inline_comments = self._limit_inline_comments(inline_comments, pr_event.pr_number)
         
         if inline_comments:
-            review_event = self._determine_review_event(agent_result)
+            review_event = self._determine_review_event()
             review_response, inline_count = self._try_post_review(
                 pr_event, agent_result, commit_sha, inline_comments, review_event
             )
@@ -233,8 +349,11 @@ class PRCommentAgent:
             tuple: (review_response: Optional[dict], inline_count: int)
                    review_response contains review details with 'id' if successful
         """
-        # Use full summary as review body (so we only have ONE summary, not two)
-        review_body = self._build_summary_comment(agent_result)
+        # Use full summary as review body unless we are going to post a separate summary comment
+        if self.post_summary:
+            review_body = "## 🤖 Automated Code Review: Findings Below\n\nSee the detailed summary at the bottom of this conversation."
+        else:
+            review_body = self._build_summary_comment(agent_result)
         
         review_response = self.github_service.post_review_with_comments(
             repository=pr_event.repository,
@@ -702,21 +821,18 @@ class PRCommentAgent:
         
         return "\n".join(lines)
     
-    def _determine_review_event(self, agent_result: AgentResult) -> str:
+    def _determine_review_event(self) -> str:
         """
         Determine the review event type based on findings.
         
         Returns:
-            'REQUEST_CHANGES' if critical issues found
-            'COMMENT' otherwise
+            'COMMENT' for all cases (REQUEST_CHANGES disabled to avoid blocking PRs)
         """
-        issues = agent_result.issues if hasattr(agent_result, 'issues') and agent_result.issues else []
-        critical = sum(1 for i in issues if i.severity == Severity.CRITICAL)
-        
-        if critical > 0:
-            return 'REQUEST_CHANGES'
-        else:
-            return 'COMMENT'
+        # Always use COMMENT to avoid blocking PRs
+        # In the future, could implement logic like:
+        # if agent_result.critical_count > 0:
+        #     return 'REQUEST_CHANGES'
+        return 'COMMENT'
     
     def _prioritize_comments(self, comments: List[Dict]) -> List[Dict]:
         """Prioritize comments by severity."""

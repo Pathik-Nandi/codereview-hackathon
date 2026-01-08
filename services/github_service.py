@@ -280,6 +280,47 @@ class GitHubService:
             # In case of error, return False to allow processing
             return False
     
+    def find_summary_comment(self, repository: str, pr_number: int, signature: str = "## 🤖 Automated Code Review Results") -> Optional[dict]:
+        """
+        Search for an existing summary comment by the bot on a PR.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            signature: The unique string to identify the bot's summary
+            
+        Returns:
+            Dict with comment details if found, None otherwise
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            
+            for comment in pr.get_issue_comments():
+                if signature in comment.body:
+                    self.logger.info(
+                        "Found existing bot summary comment",
+                        repository=repository,
+                        pr_number=pr_number,
+                        comment_id=comment.id
+                    )
+                    return {
+                        'id': comment.id,
+                        'body': comment.body,
+                        'html_url': comment.html_url
+                    }
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(
+                "Failed to search for existing summary comment",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            return None
+
     def post_comment(self, repository: str, pr_number: int, comment: str) -> Optional[dict]:
         """
         Post a comment on a PR.

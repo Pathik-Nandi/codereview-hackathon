@@ -1,0 +1,75 @@
+# Web Framework
+flask==3.0.0
+flask-cors==4.0.0
+gunicorn==21.2.0
+
+# GitHub Integration
+PyGithub==2.1.1
+requests==2.31.0
+
+# Slack Integration
+slack-sdk==3.26.1
+
+# Code Analysis Tools
+pylint==3.0.3
+flake8==7.0.0
+bandit==1.7.6
+radon==6.0.1
+safety==3.0.1
+
+# Async Processing
+celery==5.3.4
+redis==5.0.1
+
+# Configuration
+python-dotenv==1.0.0
+pyyaml==6.0.1
+
+# Logging and Monitoring
+structlog==24.1.0
+
+# Utilities
+python-dateutil==2.8.2
+typing-extensions==4.9.0
+
+# Database
+psycopg2-binary==2.9.9
+SQLAlchemy==2.0.23
+alembic==1.13.1
+
+# Authentication and Security
+PyJWT==2.8.0
+passlib==1.7.4
+bcrypt==4.1.2
+
+# AI/LLM Integration (Optional - install based on your choice)
+# For Google Gemini (Recommended - has free tier)
+google-generativeai==0.3.2
+
+# For OpenAI GPT
+openai==1.7.0
+
+# For Anthropic Claude (Alternative)
+# anthropic==0.8.1
+
+# For LangChain (Advanced AI orchestration)
+# langchain==0.1.0
+
+# RAG (Retrieval-Augmented Generation) Dependencies
+# Vector database for semantic search
+chromadb==0.4.22
+
+# Embeddings model for RAG
+sentence-transformers==2.3.1
+
+# Additional ML dependencies for RAG
+torch==2.1.2  # Required by sentence-transformers
+numpy==1.24.3
+
+# Testing
+pytest==8.0.0
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+responses==0.24.1  # For mocking HTTP requests
+pytest-asyncio==0.23.3
+locust==2.24.0  # Load testing

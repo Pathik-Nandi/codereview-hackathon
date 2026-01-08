@@ -180,7 +180,7 @@ output:
 database:
   enabled: true
   host: "localhost"
-  port: 5433
+  port: 5432
   database: "pr_analysis"
   username: "postgres"
   password: "postgres"

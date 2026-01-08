@@ -502,7 +502,33 @@ def _persist_analysis(pr_event, pr_details, result, data, response_data):
             'updated_at': pr_details.get('updated_at')
         }
         
+        # Get author email from multiple sources (in priority order):
+        # 1. Explicitly provided in request
+        # 2. From PR user object (GitHub API)
+        # 3. From PR commits (fallback)
         author_email = data.get('author_email')
+        if not author_email:
+            author_email = pr_details.get('user', {}).get('email')
+        if not author_email:
+            # Try to extract from PR commits
+            try:
+                author_email = github_service.get_author_email_from_commits(
+                    pr_event.repository,
+                    pr_event.pr_number
+                )
+                if author_email:
+                    logger.info(
+                        "Extracted author email from commits",
+                        repository=pr_event.repository,
+                        pr_number=pr_event.pr_number,
+                        email=author_email
+                    )
+            except Exception as email_error:
+                logger.warning(
+                    "Failed to extract email from commits",
+                    error=str(email_error)
+                )
+
         persistence_result = db_persistence_agent.persist_analysis(
             pr_data=pr_data,
             analysis_result=result,

@@ -47,15 +47,16 @@ class GitHubService:
     def _extract_email_from_commit(self, commit, pr_author_login: str) -> Optional[str]:
         """Extract email from a single commit if author matches PR author."""
         try:
-            if not (commit.author and commit.author.login == pr_author_login):
-                return None
-            
+            # Check if we have commit author data
             if not (commit.commit and commit.commit.author and commit.commit.author.email):
                 return None
-            
+
             email = commit.commit.author.email
+
+            # Only validate email format, don't check GitHub user match
+            # (email may not be associated with any GitHub account)
             return email if self._is_valid_commit_email(email) else None
-            
+
         except Exception as commit_error:
             self.logger.debug("Error checking commit for email", error=str(commit_error))
             return None
@@ -279,6 +280,47 @@ class GitHubService:
             # In case of error, return False to allow processing
             return False
     
+    def find_summary_comment(self, repository: str, pr_number: int, signature: str = "## 🤖 Automated Code Review Results") -> Optional[dict]:
+        """
+        Search for an existing summary comment by the bot on a PR.
+        
+        Args:
+            repository: Repository full name (owner/repo)
+            pr_number: PR number
+            signature: The unique string to identify the bot's summary
+            
+        Returns:
+            Dict with comment details if found, None otherwise
+        """
+        try:
+            repo = self.github.get_repo(repository)
+            pr = repo.get_pull(pr_number)
+            
+            for comment in pr.get_issue_comments():
+                if signature in comment.body:
+                    self.logger.info(
+                        "Found existing bot summary comment",
+                        repository=repository,
+                        pr_number=pr_number,
+                        comment_id=comment.id
+                    )
+                    return {
+                        'id': comment.id,
+                        'body': comment.body,
+                        'html_url': comment.html_url
+                    }
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(
+                "Failed to search for existing summary comment",
+                repository=repository,
+                pr_number=pr_number,
+                error=str(e)
+            )
+            return None
+
     def post_comment(self, repository: str, pr_number: int, comment: str) -> Optional[dict]:
         """
         Post a comment on a PR.

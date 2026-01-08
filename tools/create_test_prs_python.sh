@@ -21,7 +21,7 @@ NC='\033[0m' # No Color
 # Configuration
 REPO_PATH="/home/pathiknandi/Desktop/Code_Review_System/codereview-hackathon"
 REPO_NAME="Pathik-Nandi/codereview-hackathon"
-BASE_BRANCH="main"
+BASE_BRANCH="master"
 
 echo "================================================================================"
 echo -e "${BLUE}🐍 PYTHON TEST PR CREATION SCRIPT${NC}"
@@ -70,10 +70,10 @@ if ! gh auth status &> /dev/null; then
     exit 1
 fi
 
-# Ensure we're on main and it's up to date
-echo -e "${BLUE}🔄 Updating main branch...${NC}"
-git checkout main
-git pull origin main
+# Ensure we're on master and it's up to date
+echo -e "${BLUE}🔄 Updating master branch...${NC}"
+git checkout master
+git pull origin master
 
 # Counter
 SUCCESS_COUNT=0
@@ -97,7 +97,7 @@ create_pr() {
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
     # Create and checkout branch
-    git checkout -b "$BRANCH_NAME" main 2>/dev/null || git checkout "$BRANCH_NAME"
+    git checkout -b "$BRANCH_NAME" master 2>/dev/null || git checkout "$BRANCH_NAME"
     
     # Create directory structure
     mkdir -p src/python/app
@@ -112,7 +112,7 @@ create_pr() {
     # Push branch
     if git push -u origin "$BRANCH_NAME" --force; then
         # Create PR
-        if gh pr create --title "$TITLE" --body "$DESCRIPTION" --base main --head "$BRANCH_NAME"; then
+        if gh pr create --title "$TITLE" --body "$DESCRIPTION" --base master --head "$BRANCH_NAME"; then
             echo -e "${GREEN}✅ PR created successfully${NC}"
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
         else
@@ -124,8 +124,8 @@ create_pr() {
         FAILURE_COUNT=$((FAILURE_COUNT + 1))
     fi
     
-    # Go back to main
-    git checkout main
+    # Go back to master
+    git checkout master
     
     echo ""
 }
